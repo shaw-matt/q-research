@@ -51,8 +51,8 @@ apply_default_style()
 # - QQQ and UPRO daily adjusted closes represent executable 4pm New York equity
 #   closes.
 # - BTC trades continuously. The BTC price aligned to an equity session is the
-#   latest available hourly BTC-USD close at or before that session's 4pm New York
-#   close.
+#   latest available completed hourly BTC-USD close at or before that session's
+#   4pm New York close.
 # - A signal observed at today's equity close is implemented at that close and
 #   earns the following close-to-close UPRO return.
 # - The beta estimate uses the most recent aligned BTC and QQQ returns available
@@ -135,7 +135,9 @@ def download_btc_hourly(start_date: str) -> pd.Series:
     else:
         index = index.tz_convert("UTC")
 
-    closes.index = index
+    # Yahoo labels hourly bars by interval start; move labels to interval close
+    # before sampling at the equity close to avoid lookahead.
+    closes.index = index + pd.Timedelta(hours=1)
     return closes.loc[closes.index >= pd.Timestamp(start_date, tz="UTC")]
 
 
@@ -154,7 +156,7 @@ def align_btc_to_equity_close(
     btc_hourly_close: pd.Series,
     equity_close_times: pd.Series,
 ) -> pd.Series:
-    """Sample BTC at the latest hourly close at or before each equity close."""
+    """Sample BTC at the latest completed hourly close at or before each equity close."""
     aligned = btc_hourly_close.reindex(
         pd.DatetimeIndex(equity_close_times),
         method="ffill",
