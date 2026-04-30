@@ -30,29 +30,33 @@
 # %%
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
 import scipy.stats as stats
 import statsmodels.api as sm
-import yfinance as yf
+from dotenv import load_dotenv
 from IPython.display import Markdown, display
 
 from research.plotting import apply_default_style
 
+load_dotenv()
 apply_default_style()
 
 # %% [markdown]
 # ## Assumptions
 #
-# - QQQ and UPRO daily adjusted closes represent executable 4pm New York equity
-#   closes.
+# - QQQ and UPRO daily closes from Massive's adjusted aggregate endpoint
+#   represent executable 4pm New York equity closes.
 # - BTC trades continuously. The BTC price aligned to an equity session is the
-#   latest available completed hourly BTC-USD close at or before that session's
-#   4pm New York close.
+#   latest available completed hourly X:BTC-USD close at or before that
+#   session's 4pm New York close. Massive hourly bars are relabeled from
+#   interval start to interval close before alignment.
 # - A signal observed at today's equity close is implemented at that close and
 #   earns the following close-to-close UPRO return.
 # - The beta estimate uses the most recent aligned BTC and QQQ returns available
@@ -62,8 +66,8 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Yahoo Finance via `yfinance` for QQQ and UPRO adjusted daily closes.
-# - Yahoo Finance via `yfinance` for BTC-USD hourly closes.
+# - Massive REST aggregates for QQQ and UPRO daily closes.
+# - Massive REST aggregates for X:BTC-USD hourly closes.
 
 # %%
 START_DATE = "2023-01-01"
@@ -75,25 +79,75 @@ ENTRY_ZSCORE = 1.5
 TRADE_NOTIONAL_USD = 10_000
 TRADING_DAYS_PER_YEAR = 252
 NY_TZ = ZoneInfo("America/New_York")
+MASSIVE_API_BASE_URL = "https://api.massive.com"
+MASSIVE_API_KEY_ENV = "MASSIVE_API_KEY"
 
 
-def extract_close(download: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    """Normalize yfinance output into one close-price column per ticker."""
-    if download.empty:
-        return pd.DataFrame(columns=tickers)
+def get_massive_api_key() -> str:
+    """Read the Massive API key from the environment or a local .env file."""
+    api_key = os.getenv(MASSIVE_API_KEY_ENV)
+    if not api_key:
+        raise ValueError(
+            f"Set {MASSIVE_API_KEY_ENV} in the environment or a local .env file "
+            "before running this notebook."
+        )
+    return api_key
 
-    if isinstance(download.columns, pd.MultiIndex):
-        if "Close" in download.columns.get_level_values(0):
-            close = download["Close"]
-        else:
-            close = download.xs("Close", level=1, axis=1)
-    else:
-        close = download[["Close"]].rename(columns={"Close": tickers[0]})
 
-    if isinstance(close, pd.Series):
-        close = close.to_frame(tickers[0])
+def request_massive_aggregates(
+    ticker: str,
+    multiplier: int,
+    timespan: str,
+    start_date: str,
+    end_date: str,
+    *,
+    adjusted: bool = True,
+) -> pd.DataFrame:
+    """Download Massive aggregate bars, following pagination when needed."""
+    api_key = get_massive_api_key()
+    url = (
+        f"{MASSIVE_API_BASE_URL}/v2/aggs/ticker/{ticker}/range/"
+        f"{multiplier}/{timespan}/{start_date}/{end_date}"
+    )
+    params = {
+        "adjusted": str(adjusted).lower(),
+        "sort": "asc",
+        "limit": 50_000,
+        "apiKey": api_key,
+    }
+    rows: list[dict] = []
 
-    return close.rename_axis("date").sort_index()
+    while url:
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Massive aggregate request for {ticker} failed with "
+                f"HTTP {response.status_code}: {response.text[:300]}"
+            )
+
+        payload = response.json()
+        rows.extend(payload.get("results", []))
+        next_url = payload.get("next_url")
+        url = next_url if next_url else ""
+        params = {"apiKey": api_key} if next_url else {}
+
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    frame = pd.DataFrame.from_records(rows)
+    frame["timestamp"] = pd.to_datetime(frame["t"], unit="ms", utc=True)
+    frame = frame.set_index("timestamp").sort_index()
+    return frame.rename(
+        columns={
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+            "vw": "vwap",
+            "n": "transactions",
+        }
+    )
 
 
 def download_equity_closes(
@@ -101,43 +155,41 @@ def download_equity_closes(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    """Download adjusted daily equity closes."""
-    raw = yf.download(
-        tickers,
-        start=start_date,
-        end=pd.Timestamp(end_date) + pd.Timedelta(days=1),
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
-    closes = extract_close(raw, tickers)
-    closes.index = pd.to_datetime(closes.index).tz_localize(None).normalize()
-    return closes.dropna(how="all")
+    """Download Massive adjusted daily equity closes."""
+    close_series = {}
+    for ticker in tickers:
+        bars = request_massive_aggregates(
+            ticker,
+            multiplier=1,
+            timespan="day",
+            start_date=start_date,
+            end_date=end_date,
+            adjusted=True,
+        )
+        closes = bars["close"].dropna()
+        closes.index = closes.index.tz_convert(NY_TZ).tz_localize(None).normalize()
+        close_series[ticker] = closes.rename(ticker)
+
+    return pd.concat(close_series.values(), axis=1).sort_index().dropna(how="all")
 
 
-def download_btc_hourly(start_date: str) -> pd.Series:
-    """Download recent hourly BTC-USD closes for equity-close alignment."""
-    raw = yf.download(
-        "BTC-USD",
-        period="730d",
-        interval="1h",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
+def download_btc_hourly(start_date: str, end_date: str) -> pd.Series:
+    """Download Massive hourly BTC-USD closes for equity-close alignment."""
+    bars = request_massive_aggregates(
+        "X:BTC-USD",
+        multiplier=1,
+        timespan="hour",
+        start_date=start_date,
+        end_date=end_date,
+        adjusted=True,
     )
-    closes = extract_close(raw, ["BTC-USD"])["BTC-USD"].dropna()
+    closes = bars["close"].dropna()
     if closes.empty:
         return closes
 
-    index = pd.to_datetime(closes.index)
-    if index.tz is None:
-        index = index.tz_localize("UTC")
-    else:
-        index = index.tz_convert("UTC")
-
-    # Yahoo labels hourly bars by interval start; move labels to interval close
-    # before sampling at the equity close to avoid lookahead.
-    closes.index = index + pd.Timedelta(hours=1)
+    # Massive aggregate timestamps mark the interval start. Relabel to the
+    # completed hourly close so a 4pm equity close never sees a future BTC bar.
+    closes.index = closes.index + pd.Timedelta(hours=1)
     return closes.loc[closes.index >= pd.Timestamp(start_date, tz="UTC")]
 
 
@@ -160,7 +212,7 @@ def align_btc_to_equity_close(
     aligned = btc_hourly_close.reindex(
         pd.DatetimeIndex(equity_close_times),
         method="ffill",
-        tolerance=pd.Timedelta(hours=3),
+        tolerance=pd.Timedelta(minutes=1),
     )
     aligned.index = equity_close_times.index
     return aligned.rename("btc_close_at_equity_close")
@@ -526,7 +578,7 @@ def plot_current_signal_dashboard(
 
 # %%
 equity_closes = download_equity_closes(["QQQ", "UPRO"], START_DATE, END_DATE)
-btc_hourly_close = download_btc_hourly(START_DATE)
+btc_hourly_close = download_btc_hourly(START_DATE, END_DATE)
 
 if equity_closes.empty:
     raise ValueError("No QQQ/UPRO equity closes were downloaded.")
@@ -693,8 +745,8 @@ plt.show()
 # %% [markdown]
 # ## Limitations
 #
-# - Yahoo's hourly BTC bars are an approximation of exact 4pm New York BTC marks;
-#   higher-quality exchange tick or minute data would improve alignment.
+# - Massive hourly BTC bars align cleanly to the 4pm New York equity close, but
+#   exchange-specific tick or minute data would still capture more precise marks.
 # - The backtest assumes closing-price execution for UPRO, no spread/slippage, no
 #   borrow or financing effects, and no tax impact.
 # - UPRO is a 3x S&P 500 ETF, not a Nasdaq ETF. If the intended instrument is
@@ -714,8 +766,8 @@ plt.show()
 #
 # ## Next Research Ideas
 #
-# - Replace Yahoo hourly BTC data with exchange minute bars sampled exactly at
-#   4pm New York.
+# - Compare hourly BTC marks with Massive minute bars or exchange tick data
+#   sampled exactly at 4pm New York.
 # - Compare UPRO with TQQQ and QQQ to separate leverage effects from index choice.
 # - Walk forward the beta and z-score lookbacks to test parameter stability.
 # - Add realistic closing-auction slippage and transaction-cost assumptions.
