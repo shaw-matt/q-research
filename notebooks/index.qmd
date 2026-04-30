@@ -4,4 +4,4 @@ This site contains rendered research notebooks.
 
 ## Studies
 
-- [Live QQQ and BTC Price Data Smoke Test](examples/live-qqq-btc-price-data.html)
+- [BTC/QQQ Residual Z-Score UPRO Backtest](examples/btc-qqq-residual-upro-backtest.html)
