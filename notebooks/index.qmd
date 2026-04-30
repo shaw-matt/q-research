@@ -4,4 +4,4 @@ This site contains rendered research notebooks.
 
 ## Studies
 
-- [Liquidation Clusters](examples/liquidation-clusters.html)
+- [Live QQQ and BTC Price Data Smoke Test](examples/live-qqq-btc-price-data.html)
