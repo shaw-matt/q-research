@@ -79,6 +79,12 @@ ZSCORE_LOOKBACK_DAYS = 20
 ENTRY_ZSCORE = 1.5
 TRADE_NOTIONAL_USD = 10_000
 TRADING_DAYS_PER_YEAR = 252
+WALK_FORWARD_BETA_LOOKBACK_GRID = [20, 40, 60, 80]
+WALK_FORWARD_ZSCORE_LOOKBACK_GRID = [10, 20, 30, 40]
+WALK_FORWARD_ENTRY_ZSCORE_GRID = [1.0, 1.5, 2.0]
+WALK_FORWARD_TRAIN_DAYS = 252
+WALK_FORWARD_TEST_DAYS = 63
+WALK_FORWARD_MIN_TRAIN_ACTIVE_DAYS = 5
 NY_TZ = ZoneInfo("America/New_York")
 MASSIVE_API_BASE_URL = "https://api.massive.com"
 MASSIVE_API_KEY_ENV = "MASSIVE_API_KEY"
@@ -271,6 +277,31 @@ def rolling_beta(y: pd.Series, x: pd.Series, lookback: int) -> pd.Series:
     return covariance / variance
 
 
+def build_strategy_analysis(
+    returns: pd.DataFrame,
+    *,
+    beta_lookback: int,
+    zscore_lookback: int,
+    entry_zscore: float,
+) -> pd.DataFrame:
+    """Build the residual z-score signal and shifted UPRO strategy returns."""
+    frame = returns.copy()
+    frame["beta"] = rolling_beta(
+        frame["BTC_return"],
+        frame["QQQ_return"],
+        beta_lookback,
+    )
+    frame["residual"] = frame["BTC_return"] - frame["beta"] * frame["QQQ_return"]
+    frame["residual_volatility"] = frame["residual"].rolling(zscore_lookback).std()
+    frame["zscore"] = frame["residual"] / frame["residual_volatility"]
+    frame["signal_at_close"] = frame["zscore"] >= entry_zscore
+    frame["position"] = frame["signal_at_close"].shift(1).fillna(False).astype(bool)
+    frame["strategy_return"] = np.where(frame["position"], frame["UPRO_return"], 0.0)
+    frame["strategy_pnl_usd"] = TRADE_NOTIONAL_USD * frame["strategy_return"]
+    frame["next_upro_return"] = frame["UPRO_return"].shift(-1)
+    return frame.dropna(subset=["beta", "residual", "zscore"]).copy()
+
+
 def max_drawdown(return_series: pd.Series) -> float:
     """Calculate max drawdown from a daily return series."""
     equity_curve = (1 + return_series.fillna(0)).cumprod()
@@ -326,6 +357,265 @@ def summarize_backtest(strategy_returns: pd.Series, positions: pd.Series) -> pd.
             ],
         }
     )
+
+
+def summarize_strategy_window(frame: pd.DataFrame) -> dict[str, float]:
+    """Return scalar performance metrics for a strategy window."""
+    if frame.empty:
+        return {
+            "observations": 0,
+            "active_days": 0,
+            "exposure_rate": np.nan,
+            "total_return": np.nan,
+            "annualized_return": np.nan,
+            "annualized_volatility": np.nan,
+            "sharpe_ratio": np.nan,
+            "max_drawdown": np.nan,
+            "active_day_win_rate": np.nan,
+            "average_active_day_return": np.nan,
+        }
+
+    returns = frame["strategy_return"].dropna()
+    positions = frame["position"].reindex(returns.index).fillna(False).astype(bool)
+    active_returns = returns.loc[positions]
+    equity_curve = (1 + returns).cumprod()
+    total_return = equity_curve.iloc[-1] - 1 if not equity_curve.empty else np.nan
+    annualized_return = (
+        equity_curve.iloc[-1] ** (TRADING_DAYS_PER_YEAR / len(returns)) - 1
+        if len(returns) and equity_curve.iloc[-1] > 0
+        else np.nan
+    )
+    annualized_volatility = returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    sharpe = (
+        returns.mean() / returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        if returns.std() > 0
+        else np.nan
+    )
+
+    return {
+        "observations": len(returns),
+        "active_days": len(active_returns),
+        "exposure_rate": positions.mean() if len(positions) else np.nan,
+        "total_return": total_return,
+        "annualized_return": annualized_return,
+        "annualized_volatility": annualized_volatility,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_drawdown(returns) if len(returns) else np.nan,
+        "active_day_win_rate": (active_returns > 0).mean() if len(active_returns) else np.nan,
+        "average_active_day_return": active_returns.mean() if len(active_returns) else np.nan,
+    }
+
+
+def run_walk_forward_parameter_test(
+    returns: pd.DataFrame,
+    *,
+    beta_lookbacks: list[int],
+    zscore_lookbacks: list[int],
+    entry_zscores: list[float],
+    train_days: int,
+    test_days: int,
+    min_train_active_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Optimize parameters on rolling train windows and evaluate the next window."""
+    strategy_frames = {}
+    for beta_lookback in beta_lookbacks:
+        for zscore_lookback in zscore_lookbacks:
+            for entry_zscore in entry_zscores:
+                key = (beta_lookback, zscore_lookback, entry_zscore)
+                strategy_frames[key] = build_strategy_analysis(
+                    returns,
+                    beta_lookback=beta_lookback,
+                    zscore_lookback=zscore_lookback,
+                    entry_zscore=entry_zscore,
+                )
+
+    window_rows = []
+    training_rank_rows = []
+    oos_segments = []
+    dates = returns.index
+    window_id = 1
+    test_start_position = train_days
+    while test_start_position + test_days <= len(dates):
+        train_index = dates[test_start_position - train_days : test_start_position]
+        test_index = dates[test_start_position : test_start_position + test_days]
+        train_start = train_index.min()
+        train_end = train_index.max()
+        test_start = test_index.min()
+        test_end = test_index.max()
+
+        candidate_rows = []
+        for key, frame in strategy_frames.items():
+            beta_lookback, zscore_lookback, entry_zscore = key
+            train_frame = frame.reindex(train_index).dropna(subset=["strategy_return"])
+            train_metrics = summarize_strategy_window(train_frame)
+            score = (
+                train_metrics["sharpe_ratio"]
+                if train_metrics["active_days"] >= min_train_active_days
+                else np.nan
+            )
+            candidate_rows.append(
+                {
+                    "window_id": window_id,
+                    "beta_lookback": beta_lookback,
+                    "zscore_lookback": zscore_lookback,
+                    "entry_zscore": entry_zscore,
+                    "train_start": train_start,
+                    "train_end": train_end,
+                    "train_score": score,
+                    **{f"train_{key}": value for key, value in train_metrics.items()},
+                }
+            )
+
+        train_rankings = pd.DataFrame(candidate_rows)
+        train_rankings = train_rankings.sort_values(
+            ["train_score", "train_total_return", "train_active_days"],
+            ascending=False,
+            na_position="last",
+        ).reset_index(drop=True)
+        train_rankings["train_rank"] = np.arange(1, len(train_rankings) + 1)
+        training_rank_rows.append(train_rankings)
+
+        eligible = train_rankings.dropna(subset=["train_score"])
+        if eligible.empty:
+            selected = train_rankings.iloc[0]
+        else:
+            selected = eligible.iloc[0]
+
+        selected_key = (
+            int(selected["beta_lookback"]),
+            int(selected["zscore_lookback"]),
+            float(selected["entry_zscore"]),
+        )
+        test_frame = strategy_frames[selected_key].reindex(test_index).dropna(
+            subset=["strategy_return"]
+        )
+        test_metrics = summarize_strategy_window(test_frame)
+        if not test_frame.empty:
+            oos_segments.append(
+                test_frame[["strategy_return", "position"]].assign(window_id=window_id)
+            )
+
+        window_rows.append(
+            {
+                "window_id": window_id,
+                "train_start": train_start,
+                "train_end": train_end,
+                "test_start": test_start,
+                "test_end": test_end,
+                "beta_lookback": selected_key[0],
+                "zscore_lookback": selected_key[1],
+                "entry_zscore": selected_key[2],
+                "train_score": selected["train_score"],
+                "train_ranked_candidates": len(train_rankings),
+                **{f"test_{key}": value for key, value in test_metrics.items()},
+            }
+        )
+
+        window_id += 1
+        test_start_position += test_days
+
+    walk_forward_results = pd.DataFrame(window_rows)
+    candidate_rankings = (
+        pd.concat(training_rank_rows, ignore_index=True)
+        if training_rank_rows
+        else pd.DataFrame()
+    )
+    walk_forward_oos = (
+        pd.concat(oos_segments).sort_index()
+        if oos_segments
+        else pd.DataFrame(columns=["strategy_return", "position", "window_id"])
+    )
+    return walk_forward_results, candidate_rankings, walk_forward_oos
+
+
+def summarize_walk_forward_stability(
+    walk_forward_results: pd.DataFrame,
+    walk_forward_oos: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize selected-parameter dispersion and combined OOS performance."""
+    parameter_columns = ["beta_lookback", "zscore_lookback", "entry_zscore"]
+    if walk_forward_results.empty:
+        empty_summary = pd.DataFrame(columns=["metric", "value"])
+        empty_counts = pd.DataFrame(columns=parameter_columns + ["windows", "share"])
+        return empty_summary, empty_counts
+
+    parameter_counts = (
+        walk_forward_results.value_counts(parameter_columns)
+        .rename("windows")
+        .reset_index()
+        .sort_values(["windows", *parameter_columns], ascending=[False, True, True, True])
+    )
+    parameter_counts["share"] = parameter_counts["windows"] / len(walk_forward_results)
+    most_common = parameter_counts.iloc[0]
+    selected = walk_forward_results[parameter_columns]
+    parameter_change_rate = (
+        selected.ne(selected.shift()).any(axis=1).iloc[1:].mean()
+        if len(selected) > 1
+        else 0.0
+    )
+    oos_metrics = summarize_strategy_window(walk_forward_oos)
+
+    stability_summary = pd.DataFrame(
+        {
+            "metric": [
+                "walk_forward_windows",
+                "unique_parameter_sets",
+                "most_common_parameter_set",
+                "most_common_parameter_share",
+                "parameter_change_rate",
+                "beta_lookback_min",
+                "beta_lookback_median",
+                "beta_lookback_max",
+                "zscore_lookback_min",
+                "zscore_lookback_median",
+                "zscore_lookback_max",
+                "entry_zscore_min",
+                "entry_zscore_median",
+                "entry_zscore_max",
+                "oos_observations",
+                "oos_active_days",
+                "oos_exposure_rate",
+                "oos_total_return_on_10k_notional",
+                "oos_total_pnl_usd",
+                "oos_annualized_return",
+                "oos_annualized_volatility",
+                "oos_sharpe_ratio",
+                "oos_max_drawdown",
+                "oos_active_day_win_rate",
+            ],
+            "value": [
+                len(walk_forward_results),
+                len(parameter_counts),
+                (
+                    f"beta={most_common['beta_lookback']}, "
+                    f"zlookback={most_common['zscore_lookback']}, "
+                    f"entry_z={most_common['entry_zscore']}"
+                ),
+                most_common["share"],
+                parameter_change_rate,
+                selected["beta_lookback"].min(),
+                selected["beta_lookback"].median(),
+                selected["beta_lookback"].max(),
+                selected["zscore_lookback"].min(),
+                selected["zscore_lookback"].median(),
+                selected["zscore_lookback"].max(),
+                selected["entry_zscore"].min(),
+                selected["entry_zscore"].median(),
+                selected["entry_zscore"].max(),
+                oos_metrics["observations"],
+                oos_metrics["active_days"],
+                oos_metrics["exposure_rate"],
+                oos_metrics["total_return"],
+                oos_metrics["total_return"] * TRADE_NOTIONAL_USD,
+                oos_metrics["annualized_return"],
+                oos_metrics["annualized_volatility"],
+                oos_metrics["sharpe_ratio"],
+                oos_metrics["max_drawdown"],
+                oos_metrics["active_day_win_rate"],
+            ],
+        }
+    )
+    return stability_summary, parameter_counts
 
 
 def compute_trade_returns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -621,6 +911,9 @@ def plot_current_signal_dashboard(
 #
 # 7. If `z >= +1.5`, enter or keep a long $10k UPRO position at the equity close.
 #    If the next close has `z < +1.5`, close the position at that close.
+# 8. Walk forward a grid of beta lookbacks, residual-volatility lookbacks, and
+#    entry thresholds by choosing the best in-sample Sharpe over a one-year
+#    window, then evaluating that choice over the next quarter.
 
 # %%
 equity_closes = download_equity_closes(["QQQ", "UPRO"], START_DATE, END_DATE)
@@ -647,21 +940,12 @@ returns = returns.rename(
     }
 ).dropna()
 
-analysis = returns.copy()
-analysis["beta"] = rolling_beta(
-    analysis["BTC_return"],
-    analysis["QQQ_return"],
-    BETA_LOOKBACK_DAYS,
+analysis = build_strategy_analysis(
+    returns,
+    beta_lookback=BETA_LOOKBACK_DAYS,
+    zscore_lookback=ZSCORE_LOOKBACK_DAYS,
+    entry_zscore=ENTRY_ZSCORE,
 )
-analysis["residual"] = analysis["BTC_return"] - analysis["beta"] * analysis["QQQ_return"]
-analysis["residual_volatility"] = analysis["residual"].rolling(ZSCORE_LOOKBACK_DAYS).std()
-analysis["zscore"] = analysis["residual"] / analysis["residual_volatility"]
-analysis["signal_at_close"] = analysis["zscore"] >= ENTRY_ZSCORE
-analysis["position"] = analysis["signal_at_close"].shift(1).fillna(False).astype(bool)
-analysis["strategy_return"] = np.where(analysis["position"], analysis["UPRO_return"], 0.0)
-analysis["strategy_pnl_usd"] = TRADE_NOTIONAL_USD * analysis["strategy_return"]
-analysis["next_upro_return"] = analysis["UPRO_return"].shift(-1)
-analysis = analysis.dropna(subset=["beta", "residual", "zscore"]).copy()
 
 analysis.tail(10)
 
@@ -744,6 +1028,78 @@ significance
 #   robust intercept significance.
 
 # %% [markdown]
+# ## Walk-Forward Parameter Stability Test
+#
+# This test checks whether the baseline parameter choices are stable rather than
+# treating one fixed lookback and threshold as settled. Each walk-forward window:
+#
+# 1. Builds the strategy for every parameter combination in the grid below.
+# 2. Ranks combinations by in-sample Sharpe over the trailing one-year training
+#    window, requiring at least five active training days to avoid selecting a
+#    nearly dormant strategy.
+# 3. Applies the selected parameters unchanged to the next quarter of returns.
+#
+# Stable parameters should be selected repeatedly across windows, show a low
+# parameter-change rate, and retain reasonable out-of-sample performance.
+
+# %%
+walk_forward_results, walk_forward_candidate_rankings, walk_forward_oos = (
+    run_walk_forward_parameter_test(
+        returns,
+        beta_lookbacks=WALK_FORWARD_BETA_LOOKBACK_GRID,
+        zscore_lookbacks=WALK_FORWARD_ZSCORE_LOOKBACK_GRID,
+        entry_zscores=WALK_FORWARD_ENTRY_ZSCORE_GRID,
+        train_days=WALK_FORWARD_TRAIN_DAYS,
+        test_days=WALK_FORWARD_TEST_DAYS,
+        min_train_active_days=WALK_FORWARD_MIN_TRAIN_ACTIVE_DAYS,
+    )
+)
+walk_forward_stability, walk_forward_parameter_counts = summarize_walk_forward_stability(
+    walk_forward_results,
+    walk_forward_oos,
+)
+
+walk_forward_stability
+
+# %%
+walk_forward_parameter_counts
+
+# %%
+walk_forward_window_summary_columns = [
+    "window_id",
+    "train_start",
+    "train_end",
+    "test_start",
+    "test_end",
+    "beta_lookback",
+    "zscore_lookback",
+    "entry_zscore",
+    "train_score",
+    "test_active_days",
+    "test_total_return",
+    "test_sharpe_ratio",
+    "test_max_drawdown",
+]
+walk_forward_results.reindex(columns=walk_forward_window_summary_columns)
+
+# %%
+if not walk_forward_results.empty:
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    plot_frame = walk_forward_results.set_index("test_start")
+    plot_frame["beta_lookback"].plot(ax=axes[0], marker="o")
+    axes[0].set_title("Selected beta lookback by walk-forward test window")
+    axes[0].set_ylabel("Days")
+    plot_frame["zscore_lookback"].plot(ax=axes[1], marker="o", color="tab:orange")
+    axes[1].set_title("Selected residual-volatility lookback")
+    axes[1].set_ylabel("Days")
+    plot_frame["entry_zscore"].plot(ax=axes[2], marker="o", color="tab:green")
+    axes[2].set_title("Selected entry z-score")
+    axes[2].set_ylabel("Z-score")
+    axes[2].set_xlabel("Out-of-sample test start")
+    fig.tight_layout()
+    plt.show()
+
+# %% [markdown]
 # ## Visualizations
 
 # %%
@@ -797,8 +1153,9 @@ plt.show()
 #   borrow or financing effects, and no tax impact.
 # - UPRO is a 3x S&P 500 ETF, not a Nasdaq ETF. If the intended instrument is
 #   TQQQ, the same process can be rerun by replacing `UPRO` with `TQQQ`.
-# - Rolling beta and z-score parameters are fixed at 40 and 20 days. Results may
-#   be sensitive to these choices and to the sampled market regime.
+# - The walk-forward test only covers the parameter grid, one-year training
+#   windows, and quarterly test windows shown above. Different grids or scoring
+#   metrics may select different parameters.
 # - Multiple hypothesis testing is not adjusted for; statistical significance
 #   should be treated as exploratory rather than conclusive.
 #
@@ -807,15 +1164,17 @@ plt.show()
 # This notebook implements the requested BTC/QQQ aligned-return residual process
 # and evaluates the rule that buys $10k of UPRO at the equity close when the
 # residual z-score is at least +1.5. The backtest tables report performance,
-# trade-level outcomes, and several significance diagnostics so the signal can be
-# assessed beyond the raw equity curve.
+# trade-level outcomes, several significance diagnostics, and a walk-forward
+# parameter-stability check so the signal can be assessed beyond the raw equity
+# curve.
 #
 # ## Next Research Ideas
 #
 # - Compare hourly BTC marks with Massive minute bars or exchange tick data
 #   sampled exactly at 4pm New York.
 # - Compare UPRO with TQQQ and QQQ to separate leverage effects from index choice.
-# - Walk forward the beta and z-score lookbacks to test parameter stability.
+# - Try alternative walk-forward objective functions such as Sortino ratio,
+#   average active-day return, or alpha versus UPRO.
 # - Add realistic closing-auction slippage and transaction-cost assumptions.
 
 # %% [markdown]
