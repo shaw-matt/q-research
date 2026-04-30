@@ -754,8 +754,8 @@ display(
     )
 )
 
-display(current_decision.style.hide(axis="index"))
-display(current_signal_state.style.hide(axis="index"))
+display(current_decision)
+display(current_signal_state)
 
 # %%
 plot_current_signal_dashboard(analysis, prices)
