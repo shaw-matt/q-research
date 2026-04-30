@@ -1,0 +1,22 @@
+# Massive API Data Source Rule
+
+Agents must use Massive API for market data in this repository.
+
+- Use Massive REST or flat-file data for equities, crypto, options, indices,
+  forex, and futures data whenever a notebook, script, analysis, or helper needs
+  historical or live market prices, trades, quotes, aggregates, snapshots, or
+  reference data.
+- Do not introduce new Yahoo Finance, yfinance, pandas-datareader, Stooq,
+  Alpha Vantage, Nasdaq Data Link, exchange-specific public scrape, or other
+  third-party market data fetches unless the user explicitly requests that
+  provider for the task.
+- Read the Massive API key from environment/configuration, preferably
+  `MASSIVE_API_KEY` or an ignored local `.env` file. Never hard-code API keys or
+  commit credentials.
+- When aligning prices across instruments or asset classes, prefer Massive
+  timestamped aggregate bars at the finest practical granularity for the
+  research question, then document the timestamp convention and alignment rule
+  in the notebook or helper.
+- If Massive cannot provide the required dataset or the environment is missing
+  credentials, fail clearly with an actionable message instead of silently
+  falling back to another provider.
