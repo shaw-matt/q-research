@@ -28,6 +28,7 @@ jobs:
       - run: uv run python -m ipykernel install --user --name python3 --display-name "Python 3"
       - run: uv run quarto render
         env:
+          PYTHONPATH: ${{ github.workspace }}
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
