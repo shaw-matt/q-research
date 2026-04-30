@@ -1,0 +1,26 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - notebooks/**/*.qmd
+    - notebooks/**/*.py
+    - "!notebooks/template.py"
+
+website:
+  title: "Research Notebooks"
+  navbar:
+    left:
+      - href: notebooks/index.qmd
+        text: Notebooks
+
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+    self-contained: false
+
+execute:
+  freeze: auto
+  warning: false
+  message: false

@@ -1,0 +1,28 @@
+[project]
+name = "q-research"
+version = "0.1.0"
+description = "AI-assisted research notebooks rendered with Quarto."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt",
+    "duckdb",
+    "ipykernel",
+    "jupyter",
+    "jupytext",
+    "matplotlib",
+    "nbclient",
+    "numpy",
+    "pandas",
+    "plotly",
+    "polars",
+    "pyarrow",
+    "python-dotenv",
+    "requests",
+    "scipy",
+    "statsmodels",
+    "yfinance",
+]
+
+[tool.uv]
+package = false

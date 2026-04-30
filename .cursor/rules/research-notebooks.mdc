@@ -1,0 +1,36 @@
+# Research Notebook Rules
+
+You are maintaining a research notebook repository.
+
+Use Jupytext percent-format `.py` notebooks as the primary notebook source format.
+Do not directly author raw `.ipynb` JSON unless explicitly asked.
+
+Each new research notebook should include:
+
+1. Title
+2. Research question
+3. Hypothesis
+4. Assumptions
+5. Data sources
+6. Methodology
+7. Analysis
+8. Visualizations
+9. Limitations
+10. Conclusion
+11. Next research ideas
+
+Use reproducible Python code.
+Prefer small helper functions in the `research/` package instead of duplicating logic across notebooks.
+Do not commit large raw data files.
+Use `data/` only for small sample files or placeholders.
+Store generated charts, tables, and intermediate outputs in `outputs/` only when necessary.
+
+Before finishing a task, run:
+
+```bash
+uv sync
+QUARTO_PYTHON=.venv/bin/python quarto render
+```
+
+If rendering fails, fix the notebook or project config.
+When creating a new notebook, update `notebooks/index.qmd` with a link to the rendered notebook.
