@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -81,6 +82,9 @@ TRADING_DAYS_PER_YEAR = 252
 NY_TZ = ZoneInfo("America/New_York")
 MASSIVE_API_BASE_URL = "https://api.massive.com"
 MASSIVE_API_KEY_ENV = "MASSIVE_API_KEY"
+MASSIVE_REQUEST_DELAY_SECONDS = float(os.getenv("MASSIVE_REQUEST_DELAY_SECONDS", "65"))
+MASSIVE_MAX_RETRIES = int(os.getenv("MASSIVE_MAX_RETRIES", "4"))
+_LAST_MASSIVE_REQUEST_AT = 0.0
 
 
 def get_massive_api_key() -> str:
@@ -92,6 +96,48 @@ def get_massive_api_key() -> str:
             "before running this notebook."
         )
     return api_key
+
+
+def wait_for_massive_rate_limit() -> None:
+    """Space Massive calls to avoid low request-per-minute plan limits in CI."""
+    global _LAST_MASSIVE_REQUEST_AT
+
+    if MASSIVE_REQUEST_DELAY_SECONDS <= 0 or _LAST_MASSIVE_REQUEST_AT <= 0:
+        return
+
+    elapsed = time.monotonic() - _LAST_MASSIVE_REQUEST_AT
+    remaining = MASSIVE_REQUEST_DELAY_SECONDS - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def request_massive_url(
+    ticker: str,
+    url: str,
+    params: dict[str, object],
+) -> requests.Response:
+    """Request a Massive URL with pacing and explicit 429 retry handling."""
+    global _LAST_MASSIVE_REQUEST_AT
+
+    for attempt in range(MASSIVE_MAX_RETRIES + 1):
+        wait_for_massive_rate_limit()
+        response = requests.get(url, params=params, timeout=30)
+        _LAST_MASSIVE_REQUEST_AT = time.monotonic()
+
+        if response.status_code != 429:
+            return response
+
+        if attempt == MASSIVE_MAX_RETRIES:
+            return response
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            retry_delay = float(retry_after) if retry_after else MASSIVE_REQUEST_DELAY_SECONDS
+        except ValueError:
+            retry_delay = MASSIVE_REQUEST_DELAY_SECONDS
+        time.sleep(max(retry_delay, MASSIVE_REQUEST_DELAY_SECONDS))
+
+    raise RuntimeError(f"Massive aggregate request for {ticker} failed unexpectedly.")
 
 
 def request_massive_aggregates(
@@ -118,7 +164,7 @@ def request_massive_aggregates(
     rows: list[dict] = []
 
     while url:
-        response = requests.get(url, params=params, timeout=30)
+        response = request_massive_url(ticker, url, params)
         if response.status_code != 200:
             raise RuntimeError(
                 f"Massive aggregate request for {ticker} failed with "
