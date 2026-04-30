@@ -45,7 +45,7 @@ from IPython.display import Markdown, display
 
 from research.plotting import apply_default_style
 
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 apply_default_style()
 
 # %% [markdown]
