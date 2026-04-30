@@ -3,7 +3,10 @@ __pycache__/
 .ipynb_checkpoints/
 _site/
 .quarto/
+_freeze/
 .env
+.env.*
+!.env.example
 data/*
 !data/.gitkeep
 outputs/*
