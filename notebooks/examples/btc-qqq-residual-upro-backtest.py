@@ -326,6 +326,182 @@ def significance_tests(frame: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
+
+def format_dashboard_value(value: object, style: str) -> str:
+    """Format dashboard values for quick end-of-day scanning."""
+    if pd.isna(value):
+        return "n/a"
+    if style == "percent":
+        return f"{value:.2%}"
+    if style == "number":
+        return f"{value:,.2f}"
+    if style == "signed_number":
+        return f"{value:+,.2f}"
+    if style == "currency":
+        return f"${value:,.2f}"
+    if style == "integer":
+        return f"{value:,.0f}"
+    return str(value)
+
+
+def classify_close_action(signal_at_close: bool, current_position: bool) -> str:
+    """Translate today's close signal and current holding state into a trade action."""
+    if signal_at_close and current_position:
+        return "HOLD long UPRO"
+    if signal_at_close and not current_position:
+        return "ENTER long UPRO"
+    if not signal_at_close and current_position:
+        return "EXIT long UPRO"
+    return "STAY FLAT"
+
+
+def build_current_signal_dashboard(
+    frame: pd.DataFrame,
+    price_frame: pd.DataFrame,
+    close_times: pd.Series,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build end-of-day decision and signal-state tables from the latest row."""
+    latest_date = frame.index.max()
+    latest = frame.loc[latest_date]
+    latest_prices = price_frame.loc[latest_date]
+    previous_zscore = frame["zscore"].shift(1).loc[latest_date]
+    zscore_gap = latest["zscore"] - ENTRY_ZSCORE
+    action = classify_close_action(
+        bool(latest["signal_at_close"]),
+        bool(latest["position"]),
+    )
+    target_notional = TRADE_NOTIONAL_USD if bool(latest["signal_at_close"]) else 0
+    target_shares = (
+        target_notional / latest_prices["UPRO"]
+        if target_notional and latest_prices["UPRO"] > 0
+        else 0
+    )
+
+    decision_table = pd.DataFrame(
+        {
+            "item": [
+                "latest_equity_session",
+                "equity_close_time_utc",
+                "end_of_day_action",
+                "signal_for_next_session",
+                "position_during_latest_session",
+                "target_upro_notional",
+                "approx_upro_shares_at_close",
+            ],
+            "value": [
+                latest_date.strftime("%Y-%m-%d"),
+                close_times.loc[latest_date].strftime("%Y-%m-%d %H:%M %Z"),
+                action,
+                "ON" if bool(latest["signal_at_close"]) else "OFF",
+                "LONG" if bool(latest["position"]) else "FLAT",
+                format_dashboard_value(target_notional, "currency"),
+                format_dashboard_value(target_shares, "number"),
+            ],
+        }
+    )
+
+    signal_table = pd.DataFrame(
+        {
+            "metric": [
+                "current_zscore",
+                "entry_threshold",
+                "zscore_margin_to_threshold",
+                "prior_session_zscore",
+                "btc_return_at_equity_close",
+                "qqq_return",
+                "rolling_beta_btc_vs_qqq",
+                "residual_return",
+                "residual_volatility",
+                "upro_close",
+                "btc_close_at_equity_close",
+            ],
+            "value": [
+                format_dashboard_value(latest["zscore"], "signed_number"),
+                format_dashboard_value(ENTRY_ZSCORE, "number"),
+                format_dashboard_value(zscore_gap, "signed_number"),
+                format_dashboard_value(previous_zscore, "signed_number"),
+                format_dashboard_value(latest["BTC_return"], "percent"),
+                format_dashboard_value(latest["QQQ_return"], "percent"),
+                format_dashboard_value(latest["beta"], "number"),
+                format_dashboard_value(latest["residual"], "percent"),
+                format_dashboard_value(latest["residual_volatility"], "percent"),
+                format_dashboard_value(latest_prices["UPRO"], "currency"),
+                format_dashboard_value(latest_prices["btc_close_at_equity_close"], "currency"),
+            ],
+        }
+    )
+    return decision_table, signal_table
+
+
+def plot_current_signal_dashboard(
+    frame: pd.DataFrame,
+    price_frame: pd.DataFrame,
+    lookback_days: int = 90,
+) -> None:
+    """Plot the latest signal state in the context of recent history."""
+    recent = frame.tail(lookback_days)
+    recent_prices = price_frame.reindex(recent.index)
+    latest_date = recent.index.max()
+    latest = recent.loc[latest_date]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=False)
+    z_ax, residual_ax, price_ax, beta_ax = axes.ravel()
+
+    recent["zscore"].plot(ax=z_ax, color="tab:blue", label="Residual z-score")
+    z_ax.axhline(ENTRY_ZSCORE, color="tab:red", linestyle="--", label=f"entry {ENTRY_ZSCORE}")
+    z_ax.axhline(0, color="black", linewidth=1)
+    z_ax.scatter(
+        [latest_date],
+        [latest["zscore"]],
+        color="tab:orange" if bool(latest["signal_at_close"]) else "tab:gray",
+        zorder=5,
+        label="latest close",
+    )
+    z_ax.set_title("Current residual z-score versus entry threshold")
+    z_ax.set_ylabel("Z-score")
+    z_ax.legend(loc="best")
+
+    residual_components = pd.DataFrame(
+        {
+            "BTC return": recent["BTC_return"],
+            "Beta-adjusted QQQ return": recent["beta"] * recent["QQQ_return"],
+            "Residual": recent["residual"],
+        }
+    ).tail(30)
+    residual_components.plot(ax=residual_ax)
+    residual_ax.axhline(0, color="black", linewidth=1)
+    residual_ax.set_title("Recent return inputs behind the residual")
+    residual_ax.set_ylabel("Daily return")
+    residual_ax.legend(loc="best")
+
+    recent_prices["UPRO"].plot(ax=price_ax, color="tab:green", label="UPRO close")
+    signal_dates = recent.index[recent["signal_at_close"]]
+    for signal_date in signal_dates:
+        price_ax.axvspan(signal_date, signal_date + pd.Timedelta(days=1), color="tab:green", alpha=0.08)
+    price_ax.scatter([latest_date], [recent_prices.loc[latest_date, "UPRO"]], color="tab:orange", zorder=5)
+    price_ax.set_title("UPRO close with signal-on sessions shaded")
+    price_ax.set_ylabel("Price ($)")
+    price_ax.legend(loc="best")
+
+    recent["beta"].plot(ax=beta_ax, color="tab:purple", label="Rolling beta")
+    beta_ax_twin = beta_ax.twinx()
+    recent["residual_volatility"].plot(
+        ax=beta_ax_twin,
+        color="tab:brown",
+        linestyle="--",
+        label="Residual volatility",
+    )
+    beta_ax.set_title("Rolling beta and residual volatility")
+    beta_ax.set_ylabel("Beta")
+    beta_ax_twin.set_ylabel("Residual volatility")
+    beta_lines, beta_labels = beta_ax.get_legend_handles_labels()
+    vol_lines, vol_labels = beta_ax_twin.get_legend_handles_labels()
+    beta_ax.legend(beta_lines + vol_lines, beta_labels + vol_labels, loc="best")
+
+    fig.suptitle("End-of-Day BTC/QQQ Residual Signal Dashboard", y=1.02)
+    fig.tight_layout()
+    plt.show()
+
 # %% [markdown]
 # ## Methodology
 #
@@ -543,3 +719,43 @@ plt.show()
 # - Compare UPRO with TQQQ and QQQ to separate leverage effects from index choice.
 # - Walk forward the beta and z-score lookbacks to test parameter stability.
 # - Add realistic closing-auction slippage and transaction-cost assumptions.
+
+# %% [markdown]
+# ## Current Signal Dashboard
+#
+# Use this final section after the market close to decide whether the strategy
+# calls for a UPRO trade for the next close-to-close holding interval. The action
+# compares today's close signal with the position that was active during the most
+# recent completed session.
+
+# %%
+current_decision, current_signal_state = build_current_signal_dashboard(
+    analysis,
+    prices,
+    equity_close_times,
+)
+latest_action = current_decision.loc[
+    current_decision["item"] == "end_of_day_action",
+    "value",
+].iloc[0]
+latest_signal_state = current_decision.loc[
+    current_decision["item"] == "signal_for_next_session",
+    "value",
+].iloc[0]
+latest_session = current_decision.loc[
+    current_decision["item"] == "latest_equity_session",
+    "value",
+].iloc[0]
+
+display(
+    Markdown(
+        f"### End-of-day decision for {latest_session}: **{latest_action}**\n\n"
+        f"Signal for the next close-to-close interval: **{latest_signal_state}**."
+    )
+)
+
+display(current_decision)
+display(current_signal_state)
+
+# %%
+plot_current_signal_dashboard(analysis, prices)
