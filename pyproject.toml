@@ -21,7 +21,6 @@ dependencies = [
     "requests",
     "scipy",
     "statsmodels",
-    "yfinance",
 ]
 
 [tool.uv]
