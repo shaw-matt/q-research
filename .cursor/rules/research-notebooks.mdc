@@ -21,16 +21,30 @@ Each new research notebook should include:
 
 Use reproducible Python code.
 Prefer small helper functions in the `research/` package instead of duplicating logic across notebooks.
-Do not commit large raw data files.
 Use `data/` only for small sample files or placeholders.
 Store generated charts, tables, and intermediate outputs in `outputs/` only when necessary.
 
-Before finishing a task, run:
+## Push Rules
+
+You may commit directly to `main` for research notebook changes.
+
+Before pushing, run:
 
 ```bash
 uv sync
 QUARTO_PYTHON=.venv/bin/python quarto render
 ```
 
-If rendering fails, fix the notebook or project config.
+Do not push if rendering fails. Fix the notebook or project config first.
+
+Do not commit:
+
+- `.env` files or API keys
+- large raw data files
+- generated cache files
+- `_site/`
+- `_freeze/`
+- `.quarto/`
+- `.venv/`
+
 When creating a new notebook, update `notebooks/index.qmd` with a link to the rendered notebook.
