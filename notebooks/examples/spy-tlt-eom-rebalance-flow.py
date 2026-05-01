@@ -50,7 +50,7 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Stooq daily close data for SPY and TLT, loaded through `research.data`.
+# - Massive daily close data for SPY and TLT, loaded through `research.data`.
 
 # %%
 START_DATE = "2004-01-01"
@@ -118,20 +118,16 @@ def build_eom_rebalance_strategy(prices: pd.DataFrame, trigger_day: int = 15) ->
     frame["TLT_mtd"] = frame.groupby("month")["TLT"].transform(lambda s: s / s.iloc[0] - 1)
 
     trigger = frame["day_in_month"] == trigger_day
-    frame["signal_asset"] = np.where(
-        trigger & (frame["SPY_mtd"] > frame["TLT_mtd"]),
-        "TLT",
-        np.where(trigger & (frame["TLT_mtd"] > frame["SPY_mtd"]), "SPY", np.nan),
-    )
+    frame["signal_asset"] = pd.Series(index=frame.index, dtype="object")
+    frame.loc[trigger & (frame["SPY_mtd"] > frame["TLT_mtd"]), "signal_asset"] = "TLT"
+    frame.loc[trigger & (frame["TLT_mtd"] > frame["SPY_mtd"]), "signal_asset"] = "SPY"
     frame["signal_asset"] = frame.groupby("month")["signal_asset"].transform("first")
     frame["next_day"] = frame.groupby("month")["day_in_month"].shift(-1)
     frame["is_last_day"] = frame["day_in_month"] == frame.groupby("month")["day_in_month"].transform("max")
 
-    frame["position_asset"] = np.where(
-        (frame["day_in_month"] > trigger_day) & ~frame["is_last_day"],
-        frame["signal_asset"],
-        np.nan,
-    )
+    frame["position_asset"] = pd.Series(index=frame.index, dtype="object")
+    active_window = (frame["day_in_month"] > trigger_day) & ~frame["is_last_day"]
+    frame.loc[active_window, "position_asset"] = frame.loc[active_window, "signal_asset"]
     frame["SPY_return"] = frame["SPY"].pct_change()
     frame["TLT_return"] = frame["TLT"].pct_change()
     frame["strategy_return"] = np.where(
