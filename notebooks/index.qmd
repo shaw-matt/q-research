@@ -5,3 +5,6 @@ This site contains rendered research notebooks.
 ## Studies
 
 - [BTC/QQQ Residual Z-Score UPRO Backtest](examples/btc-qqq-residual-upro-backtest.html)
+- [End-of-Month SPY/TLT Rebalance Flow](examples/spy-tlt-eom-rebalance-flow.html)
+- [Short-Term SPY/TLT Relative Reversal](examples/spy-tlt-short-term-reversal.html)
+- [TLT Turn-of-Month Effect](examples/tlt-turn-of-month-effect.html)

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from io import StringIO
+
 import numpy as np
 import pandas as pd
+import requests
 
 
 def make_synthetic_liquidation_data(
@@ -44,3 +47,36 @@ def make_synthetic_liquidation_data(
             "short_liquidations_usd": short_liquidations,
         }
     )
+
+
+def download_stooq_daily_closes(
+    tickers: list[str],
+    *,
+    start_date: str = "2004-01-01",
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Download daily close data from Stooq for the provided U.S. tickers."""
+    close_series: list[pd.Series] = []
+    end_timestamp = pd.Timestamp.today().normalize() if end_date is None else pd.Timestamp(end_date)
+    start_timestamp = pd.Timestamp(start_date)
+
+    for ticker in tickers:
+        symbol = f"{ticker.lower()}.us"
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+
+        frame = pd.read_csv(StringIO(response.text))
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
+        frame = frame.loc[
+            (frame["Date"] >= start_timestamp) & (frame["Date"] <= end_timestamp),
+            ["Date", "Close"],
+        ]
+        series = frame.set_index("Date")["Close"].rename(ticker.upper())
+        close_series.append(series)
+
+    if not close_series:
+        return pd.DataFrame()
+
+    return pd.concat(close_series, axis=1).sort_index().dropna(how="all")
