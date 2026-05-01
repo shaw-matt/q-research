@@ -77,6 +77,7 @@ END_DATE = datetime.now(UTC).date().isoformat()
 BETA_LOOKBACK_DAYS = 40
 ZSCORE_LOOKBACK_DAYS = 20
 ENTRY_ZSCORE = 1.5
+ENTRY_ZSCORE_COMPARISON_GRID = [0.5, 1.0, 1.5, 2.0]
 TRADE_NOTIONAL_USD = 10_000
 TRADING_DAYS_PER_YEAR = 252
 WALK_FORWARD_BETA_LOOKBACK_GRID = [20, 40, 60, 80]
@@ -404,6 +405,41 @@ def summarize_strategy_window(frame: pd.DataFrame) -> dict[str, float]:
         "active_day_win_rate": (active_returns > 0).mean() if len(active_returns) else np.nan,
         "average_active_day_return": active_returns.mean() if len(active_returns) else np.nan,
     }
+
+
+def compare_entry_zscores(
+    returns: pd.DataFrame,
+    entry_zscores: list[float],
+    *,
+    beta_lookback: int,
+    zscore_lookback: int,
+) -> pd.DataFrame:
+    """Compare fixed-lookback strategy performance across entry z-score thresholds."""
+    rows = []
+    for entry_zscore in entry_zscores:
+        frame = build_strategy_analysis(
+            returns,
+            beta_lookback=beta_lookback,
+            zscore_lookback=zscore_lookback,
+            entry_zscore=entry_zscore,
+        )
+        metrics = summarize_strategy_window(frame)
+        rows.append(
+            {
+                "entry_zscore": entry_zscore,
+                "active_days": metrics["active_days"],
+                "exposure_rate": metrics["exposure_rate"],
+                "total_return_on_10k_notional": metrics["total_return"],
+                "total_pnl_usd": metrics["total_return"] * TRADE_NOTIONAL_USD,
+                "annualized_return": metrics["annualized_return"],
+                "sharpe_ratio": metrics["sharpe_ratio"],
+                "max_drawdown": metrics["max_drawdown"],
+                "active_day_win_rate": metrics["active_day_win_rate"],
+                "average_active_day_return": metrics["average_active_day_return"],
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def run_walk_forward_parameter_test(
@@ -977,6 +1013,22 @@ latest_signal
 # %%
 backtest_summary = summarize_backtest(analysis["strategy_return"], analysis["position"])
 backtest_summary
+
+# %% [markdown]
+# ### Entry Z-Score Comparison
+#
+# The table below keeps the baseline 40-day beta lookback and 20-day residual
+# volatility lookback fixed, then compares strategy returns and Sharpe ratio at
+# entry thresholds of 0.5, 1.0, 1.5, and 2.0.
+
+# %%
+entry_zscore_comparison = compare_entry_zscores(
+    returns,
+    ENTRY_ZSCORE_COMPARISON_GRID,
+    beta_lookback=BETA_LOOKBACK_DAYS,
+    zscore_lookback=ZSCORE_LOOKBACK_DAYS,
+)
+entry_zscore_comparison
 
 # %%
 trades = compute_trade_returns(analysis)
