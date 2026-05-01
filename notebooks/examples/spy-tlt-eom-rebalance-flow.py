@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from research.data import download_stooq_daily_closes
+from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
 
 apply_default_style()
@@ -143,7 +143,7 @@ def build_eom_rebalance_strategy(prices: pd.DataFrame, trigger_day: int = 15) ->
     return frame
 
 
-prices = download_stooq_daily_closes(["SPY", "TLT"], start_date=START_DATE).dropna()
+prices = download_massive_daily_closes(["SPY", "TLT"], start_date=START_DATE).dropna()
 if prices.empty:
     raise ValueError("No SPY/TLT daily prices were downloaded.")
 

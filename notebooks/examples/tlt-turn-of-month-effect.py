@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from research.data import download_stooq_daily_closes
+from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
 
 apply_default_style()
@@ -129,7 +129,7 @@ def build_turn_of_month_positions(index: pd.DatetimeIndex, window_days: int = 5)
     return frame["position_signal"]
 
 
-tlt = download_stooq_daily_closes(["TLT"], start_date=START_DATE).dropna()
+tlt = download_massive_daily_closes(["TLT"], start_date=START_DATE).dropna()
 if tlt.empty:
     raise ValueError("No TLT daily prices were downloaded.")
 
