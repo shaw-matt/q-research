@@ -8,3 +8,4 @@ This site contains rendered research notebooks.
 - [End-of-Month SPY/TLT Rebalance Flow](examples/spy-tlt-eom-rebalance-flow.html)
 - [Short-Term SPY/TLT Relative Reversal](examples/spy-tlt-short-term-reversal.html)
 - [TLT Turn-of-Month Effect](examples/tlt-turn-of-month-effect.html)
+- [Vol-Targeted Optimized Portfolio of SPY/TLT Signals](examples/spy-tlt-signal-portfolio-vol-target.html)
