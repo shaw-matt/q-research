@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+  schedule:
+    # GitHub schedules use UTC. These cover 4 PM America/Chicago in
+    # daylight and standard time; the job below skips the non-matching run.
+    - cron: "0 21 * * *"
+    - cron: "0 22 * * *"
   workflow_dispatch:
 
 permissions:
@@ -14,25 +19,44 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      SHOULD_PUBLISH: "true"
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Confirm scheduled run time
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(TZ=America/Chicago date +%H)" != "16" ]; then
+            echo "SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            echo "Skipping because it is not 4 PM CT."
+          fi
       - uses: actions/checkout@v4
+        if: env.SHOULD_PUBLISH == 'true'
       - uses: quarto-dev/quarto-actions/setup@v2
+        if: env.SHOULD_PUBLISH == 'true'
       - uses: astral-sh/setup-uv@v5
+        if: env.SHOULD_PUBLISH == 'true'
       - uses: actions/setup-python@v5
+        if: env.SHOULD_PUBLISH == 'true'
         with:
           python-version: "3.12"
       - run: uv sync
+        if: env.SHOULD_PUBLISH == 'true'
       - run: uv run python -m ipykernel install --user --name python3 --display-name "Python 3"
+        if: env.SHOULD_PUBLISH == 'true'
       - run: uv run quarto render
+        if: env.SHOULD_PUBLISH == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
       - uses: actions/configure-pages@v5
+        if: env.SHOULD_PUBLISH == 'true'
       - uses: actions/upload-pages-artifact@v3
+        if: env.SHOULD_PUBLISH == 'true'
         with:
           path: _site
       - id: deployment
+        if: env.SHOULD_PUBLISH == 'true'
         uses: actions/deploy-pages@v4
