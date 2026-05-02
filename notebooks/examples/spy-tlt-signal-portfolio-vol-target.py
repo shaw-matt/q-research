@@ -38,6 +38,7 @@ from scipy.optimize import minimize
 
 from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
+from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
 from research.upro_residual import build_upro_residual_strategy_returns
 
 load_dotenv(dotenv_path=".env")
@@ -305,8 +306,22 @@ for strategy_name in [
     "optimized_vol_target_return",
 ]:
     full_metrics = summarize_returns(portfolio_returns[strategy_name])
-    train_metrics = summarize_returns(portfolio_returns.loc[train_returns.index, strategy_name])
-    test_metrics = summarize_returns(portfolio_returns.loc[test_returns.index, strategy_name])
+    train_series = portfolio_returns.loc[train_returns.index, strategy_name].dropna()
+    test_series = portfolio_returns.loc[test_returns.index, strategy_name].dropna()
+    train_metrics = summarize_returns(train_series)
+    test_metrics = summarize_returns(test_series)
+    if strategy_name == "optimized_vol_target_return":
+        full_exposure = vol_target_frame["leverage"].reindex(
+            portfolio_returns[strategy_name].dropna().index
+        ).fillna(1.0)
+        train_exposure = vol_target_frame["leverage"].reindex(train_series.index).fillna(1.0)
+        test_exposure = vol_target_frame["leverage"].reindex(test_series.index).fillna(1.0)
+    else:
+        full_exposure = pd.Series(
+            1.0, index=portfolio_returns[strategy_name].dropna().index
+        )
+        train_exposure = pd.Series(1.0, index=train_series.index)
+        test_exposure = pd.Series(1.0, index=test_series.index)
     summary_rows.append(
         {
             "strategy": strategy_name,
@@ -314,10 +329,22 @@ for strategy_name in [
             "full_sharpe": full_metrics["sharpe_ratio"],
             "full_max_drawdown": full_metrics["max_drawdown"],
             "full_ann_vol": full_metrics["annualized_volatility"],
+            "full_mean_daily_turnover_one_way": mean_daily_turnover_one_way(full_exposure),
+            "full_annualized_turnover_one_way": annualized_turnover_one_way(
+                full_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
+            ),
             "train_sharpe": train_metrics["sharpe_ratio"],
+            "train_mean_daily_turnover_one_way": mean_daily_turnover_one_way(train_exposure),
+            "train_annualized_turnover_one_way": annualized_turnover_one_way(
+                train_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
+            ),
             "test_sharpe": test_metrics["sharpe_ratio"],
             "test_total_return": test_metrics["total_return"],
             "test_max_drawdown": test_metrics["max_drawdown"],
+            "test_mean_daily_turnover_one_way": mean_daily_turnover_one_way(test_exposure),
+            "test_annualized_turnover_one_way": annualized_turnover_one_way(
+                test_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
+            ),
         }
     )
 

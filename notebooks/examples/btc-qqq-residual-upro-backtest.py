@@ -47,6 +47,7 @@ from research.massive_flatfiles import (
     download_flatfile_stock_day_closes as download_equity_closes,
 )
 from research.plotting import apply_default_style
+from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
 
 load_dotenv(dotenv_path=".env")
 apply_default_style()
@@ -132,6 +133,7 @@ def max_drawdown(return_series: pd.Series) -> float:
 def summarize_backtest(strategy_returns: pd.Series, positions: pd.Series) -> pd.DataFrame:
     """Summarize close-to-close strategy performance."""
     returns = strategy_returns.dropna()
+    pos = positions.reindex(returns.index).fillna(False).astype(float)
     active_returns = returns.loc[positions.reindex(returns.index).fillna(False)]
     equity_curve = (1 + returns).cumprod()
     total_return = equity_curve.iloc[-1] - 1 if not equity_curve.empty else np.nan
@@ -153,6 +155,8 @@ def summarize_backtest(strategy_returns: pd.Series, positions: pd.Series) -> pd.
                 "observations",
                 "active_days",
                 "exposure_rate",
+                "mean_daily_turnover_one_way",
+                "annualized_turnover_one_way",
                 "total_return_on_10k_notional",
                 "total_pnl_usd",
                 "annualized_return",
@@ -166,6 +170,10 @@ def summarize_backtest(strategy_returns: pd.Series, positions: pd.Series) -> pd.
                 len(returns),
                 len(active_returns),
                 positions.reindex(returns.index).fillna(False).mean(),
+                mean_daily_turnover_one_way(pos),
+                annualized_turnover_one_way(
+                    pos, trading_days_per_year=TRADING_DAYS_PER_YEAR
+                ),
                 total_return,
                 total_return * TRADE_NOTIONAL_USD,
                 annualized_return,
@@ -186,6 +194,8 @@ def summarize_strategy_window(frame: pd.DataFrame) -> dict[str, float]:
             "observations": 0,
             "active_days": 0,
             "exposure_rate": np.nan,
+            "mean_daily_turnover_one_way": np.nan,
+            "annualized_turnover_one_way": np.nan,
             "total_return": np.nan,
             "annualized_return": np.nan,
             "annualized_volatility": np.nan,
@@ -197,6 +207,7 @@ def summarize_strategy_window(frame: pd.DataFrame) -> dict[str, float]:
 
     returns = frame["strategy_return"].dropna()
     positions = frame["position"].reindex(returns.index).fillna(False).astype(bool)
+    pos_float = positions.astype(float)
     active_returns = returns.loc[positions]
     equity_curve = (1 + returns).cumprod()
     total_return = equity_curve.iloc[-1] - 1 if not equity_curve.empty else np.nan
@@ -216,6 +227,10 @@ def summarize_strategy_window(frame: pd.DataFrame) -> dict[str, float]:
         "observations": len(returns),
         "active_days": len(active_returns),
         "exposure_rate": positions.mean() if len(positions) else np.nan,
+        "mean_daily_turnover_one_way": mean_daily_turnover_one_way(pos_float),
+        "annualized_turnover_one_way": annualized_turnover_one_way(
+            pos_float, trading_days_per_year=TRADING_DAYS_PER_YEAR
+        ),
         "total_return": total_return,
         "annualized_return": annualized_return,
         "annualized_volatility": annualized_volatility,
@@ -248,6 +263,8 @@ def compare_entry_zscores(
                 "entry_zscore": entry_zscore,
                 "active_days": metrics["active_days"],
                 "exposure_rate": metrics["exposure_rate"],
+                "mean_daily_turnover_one_way": metrics["mean_daily_turnover_one_way"],
+                "annualized_turnover_one_way": metrics["annualized_turnover_one_way"],
                 "total_return_on_10k_notional": metrics["total_return"],
                 "total_pnl_usd": metrics["total_return"] * TRADE_NOTIONAL_USD,
                 "annualized_return": metrics["annualized_return"],
@@ -430,6 +447,8 @@ def summarize_walk_forward_stability(
                 "oos_observations",
                 "oos_active_days",
                 "oos_exposure_rate",
+                "oos_mean_daily_turnover_one_way",
+                "oos_annualized_turnover_one_way",
                 "oos_total_return_on_10k_notional",
                 "oos_total_pnl_usd",
                 "oos_annualized_return",
@@ -460,6 +479,8 @@ def summarize_walk_forward_stability(
                 oos_metrics["observations"],
                 oos_metrics["active_days"],
                 oos_metrics["exposure_rate"],
+                oos_metrics["mean_daily_turnover_one_way"],
+                oos_metrics["annualized_turnover_one_way"],
                 oos_metrics["total_return"],
                 oos_metrics["total_return"] * TRADE_NOTIONAL_USD,
                 oos_metrics["annualized_return"],

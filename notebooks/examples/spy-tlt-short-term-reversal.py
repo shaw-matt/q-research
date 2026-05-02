@@ -34,6 +34,11 @@ import pandas as pd
 
 from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
+from research.stats import (
+    annualized_turnover_one_way,
+    mean_daily_turnover_one_way,
+    spy_tlt_long_only_weights,
+)
 
 apply_default_style()
 
@@ -64,6 +69,7 @@ def max_drawdown(return_series: pd.Series) -> float:
 def summarize_strategy(strategy_returns: pd.Series, position_asset: pd.Series) -> pd.DataFrame:
     returns = strategy_returns.dropna()
     position = position_asset.reindex(returns.index)
+    weights = spy_tlt_long_only_weights(position).reindex(returns.index).fillna(0.0)
     active_returns = returns[position.isin(["SPY", "TLT"])]
     equity = (1 + returns).cumprod()
     total_return = equity.iloc[-1] - 1 if not equity.empty else np.nan
@@ -85,6 +91,8 @@ def summarize_strategy(strategy_returns: pd.Series, position_asset: pd.Series) -
                 "active_days",
                 "long_spy_share",
                 "long_tlt_share",
+                "mean_daily_turnover_one_way",
+                "annualized_turnover_one_way",
                 "total_return",
                 "annualized_return",
                 "annualized_volatility",
@@ -97,6 +105,10 @@ def summarize_strategy(strategy_returns: pd.Series, position_asset: pd.Series) -
                 len(active_returns),
                 (position == "SPY").mean(),
                 (position == "TLT").mean(),
+                mean_daily_turnover_one_way(weights),
+                annualized_turnover_one_way(
+                    weights, trading_days_per_year=TRADING_DAYS_PER_YEAR
+                ),
                 total_return,
                 annualized_return,
                 annualized_volatility,

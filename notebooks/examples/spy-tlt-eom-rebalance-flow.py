@@ -36,6 +36,11 @@ import pandas as pd
 
 from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
+from research.stats import (
+    annualized_turnover_one_way,
+    mean_daily_turnover_one_way,
+    spy_tlt_long_only_weights,
+)
 
 apply_default_style()
 
@@ -64,9 +69,12 @@ def max_drawdown(return_series: pd.Series) -> float:
     return float(drawdown.min())
 
 
-def summarize_strategy(strategy_returns: pd.Series, positions: pd.Series) -> pd.DataFrame:
+def summarize_strategy(
+    strategy_returns: pd.Series, positions: pd.Series, position_asset: pd.Series
+) -> pd.DataFrame:
     returns = strategy_returns.dropna()
     active_returns = returns.loc[positions.reindex(returns.index).fillna(False)]
+    weights = spy_tlt_long_only_weights(position_asset).reindex(returns.index).fillna(0.0)
     equity = (1 + returns).cumprod()
     total_return = equity.iloc[-1] - 1 if not equity.empty else np.nan
     annualized_return = (
@@ -86,6 +94,8 @@ def summarize_strategy(strategy_returns: pd.Series, positions: pd.Series) -> pd.
                 "observations",
                 "active_days",
                 "exposure_rate",
+                "mean_daily_turnover_one_way",
+                "annualized_turnover_one_way",
                 "total_return",
                 "annualized_return",
                 "annualized_volatility",
@@ -98,6 +108,10 @@ def summarize_strategy(strategy_returns: pd.Series, positions: pd.Series) -> pd.
                 len(returns),
                 len(active_returns),
                 positions.reindex(returns.index).fillna(False).mean(),
+                mean_daily_turnover_one_way(weights),
+                annualized_turnover_one_way(
+                    weights, trading_days_per_year=TRADING_DAYS_PER_YEAR
+                ),
                 total_return,
                 annualized_return,
                 annualized_volatility,
@@ -167,7 +181,9 @@ signal_snapshots = analysis.loc[
 signal_snapshots
 
 # %%
-performance_summary = summarize_strategy(analysis["strategy_return"], analysis["position"])
+performance_summary = summarize_strategy(
+    analysis["strategy_return"], analysis["position"], analysis["position_asset"]
+)
 performance_summary
 
 # %%
