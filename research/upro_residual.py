@@ -20,19 +20,18 @@ def rolling_beta(y: pd.Series, x: pd.Series, lookback: int) -> pd.Series:
     return covariance / variance
 
 
-def build_upro_residual_strategy_returns(
+def build_upro_residual_strategy_frame(
     *,
     start_date: str,
     end_date: str | None = None,
     beta_lookback: int = 40,
     zscore_lookback: int = 20,
     entry_zscore: float = 1.5,
-) -> pd.Series:
+) -> pd.DataFrame:
     """
-    Daily strategy returns: long UPRO when prior close had residual z-score >= entry.
+    Strategy returns plus 0/1 UPRO exposure (same index as ``strategy_return``).
 
-    Matches the baseline rule in ``notebooks/examples/btc-qqq-residual-upro-backtest.py``:
-    signal at close t, position earns UPRO return from t to t+1.
+    Long UPRO when the prior close had residual z-score >= ``entry_zscore``.
     """
     end = pd.Timestamp.today(tz="UTC").date().isoformat() if end_date is None else end_date
 
@@ -70,5 +69,31 @@ def build_upro_residual_strategy_returns(
     frame["position"] = frame["signal_at_close"].shift(1).fillna(False).astype(bool)
     frame["strategy_return"] = np.where(frame["position"], frame["UPRO_return"], 0.0)
 
-    out = frame.dropna(subset=["beta", "residual", "zscore"])["strategy_return"]
-    return out.rename("upro_residual")
+    out = frame.dropna(subset=["beta", "residual", "zscore"])
+    return out[["strategy_return", "position"]].assign(
+        upro_exposure=lambda df: df["position"].astype(float)
+    ).drop(columns=["position"])
+
+
+def build_upro_residual_strategy_returns(
+    *,
+    start_date: str,
+    end_date: str | None = None,
+    beta_lookback: int = 40,
+    zscore_lookback: int = 20,
+    entry_zscore: float = 1.5,
+) -> pd.Series:
+    """
+    Daily strategy returns: long UPRO when prior close had residual z-score >= entry.
+
+    Matches the baseline rule in ``notebooks/examples/btc-qqq-residual-upro-backtest.py``:
+    signal at close t, position earns UPRO return from t to t+1.
+    """
+    frame = build_upro_residual_strategy_frame(
+        start_date=start_date,
+        end_date=end_date,
+        beta_lookback=beta_lookback,
+        zscore_lookback=zscore_lookback,
+        entry_zscore=entry_zscore,
+    )
+    return frame["strategy_return"].rename("upro_residual")
