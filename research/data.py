@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from io import StringIO
 
 import numpy as np
@@ -83,70 +82,6 @@ def download_stooq_daily_closes(
     return pd.concat(close_series, axis=1).sort_index().dropna(how="all")
 
 
-def get_massive_api_key() -> str:
-    """Read Massive API key from the environment."""
-    api_key = os.getenv("MASSIVE_API_KEY")
-    if not api_key:
-        raise ValueError("Set MASSIVE_API_KEY in environment or .env before running notebook.")
-    return api_key
-
-
-def request_massive_aggregates(
-    ticker: str,
-    multiplier: int,
-    timespan: str,
-    start_date: str,
-    end_date: str,
-    *,
-    adjusted: bool = True,
-) -> pd.DataFrame:
-    """Download Massive aggregate bars with pagination support."""
-    api_key = get_massive_api_key()
-    url = (
-        f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/"
-        f"{multiplier}/{timespan}/{start_date}/{end_date}"
-    )
-    params: dict[str, object] = {
-        "adjusted": str(adjusted).lower(),
-        "sort": "asc",
-        "limit": 50_000,
-        "apiKey": api_key,
-    }
-    rows: list[dict] = []
-
-    while url:
-        response = requests.get(url, params=params, timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Massive aggregate request for {ticker} failed with "
-                f"HTTP {response.status_code}: {response.text[:300]}"
-            )
-
-        payload = response.json()
-        rows.extend(payload.get("results", []))
-        next_url = payload.get("next_url")
-        url = next_url if next_url else ""
-        params = {"apiKey": api_key} if next_url else {}
-
-    if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-    frame = pd.DataFrame.from_records(rows)
-    frame["timestamp"] = pd.to_datetime(frame["t"], unit="ms", utc=True)
-    frame = frame.set_index("timestamp").sort_index()
-    return frame.rename(
-        columns={
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
-            "vw": "vwap",
-            "n": "transactions",
-        }
-    )
-
-
 def download_massive_daily_closes(
     tickers: list[str],
     *,
@@ -154,24 +89,9 @@ def download_massive_daily_closes(
     end_date: str | None = None,
     adjusted: bool = True,
 ) -> pd.DataFrame:
-    """Download daily close data for tickers from Massive."""
+    """Download daily US equity closes from Massive S3 flat files (day aggregates)."""
+    _ = adjusted  # SIP day aggregates are split-adjusted; kept for call-site compatibility.
+    from research.massive_flatfiles import download_flatfile_stock_day_closes
+
     end = pd.Timestamp.today(tz="UTC").date().isoformat() if end_date is None else end_date
-    close_series: list[pd.Series] = []
-
-    for ticker in tickers:
-        bars = request_massive_aggregates(
-            ticker.upper(),
-            multiplier=1,
-            timespan="day",
-            start_date=start_date,
-            end_date=end,
-            adjusted=adjusted,
-        )
-        closes = bars["close"].dropna()
-        closes.index = closes.index.tz_convert("America/New_York").tz_localize(None).normalize()
-        close_series.append(closes.rename(ticker.upper()))
-
-    if not close_series:
-        return pd.DataFrame()
-
-    return pd.concat(close_series, axis=1).sort_index().dropna(how="all")
+    return download_flatfile_stock_day_closes(tickers, start_date, end)

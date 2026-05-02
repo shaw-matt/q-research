@@ -50,7 +50,7 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Massive daily close data for SPY and TLT, loaded through `research.data`.
+# - Massive S3 flat files (US stock day aggregates) for SPY and TLT via `research.data`.
 
 # %%
 START_DATE = "2004-01-01"

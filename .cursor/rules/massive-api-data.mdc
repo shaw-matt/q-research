@@ -10,9 +10,11 @@ Agents must use Massive API for market data in this repository.
   Alpha Vantage, Nasdaq Data Link, exchange-specific public scrape, or other
   third-party market data fetches unless the user explicitly requests that
   provider for the task.
-- Read the Massive API key from environment/configuration, preferably
-  `MASSIVE_API_KEY` or an ignored local `.env` file. Never hard-code API keys or
-  commit credentials.
+- Read Massive credentials from environment or an ignored local `.env` file.
+  Flat-file (S3) access uses `MASSIVE_S3_ACCESS_KEY_ID` and
+  `MASSIVE_S3_SECRET_ACCESS_KEY` (or standard `AWS_*` variables) with endpoint
+  `MASSIVE_FILES_ENDPOINT` defaulting to `https://files.massive.com`. Never
+  hard-code keys or commit credentials.
 - When aligning prices across instruments or asset classes, prefer Massive
   timestamped aggregate bars at the finest practical granularity for the
   research question, then document the timestamp convention and alignment rule

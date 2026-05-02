@@ -47,7 +47,7 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Stooq daily close data for SPY and TLT.
+# - Massive S3 flat files (US stock day aggregates) for SPY and TLT via `research.data`.
 
 # %%
 START_DATE = "2004-01-01"

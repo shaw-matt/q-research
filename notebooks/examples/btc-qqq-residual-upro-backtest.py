@@ -30,20 +30,22 @@
 # %%
 from __future__ import annotations
 
-import os
-import time
 from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import requests
 import scipy.stats as stats
 import statsmodels.api as sm
 from dotenv import load_dotenv
 from IPython.display import Markdown, display
 
+from research.massive_flatfiles import (
+    align_btc_to_equity_close,
+    build_equity_close_times,
+    download_flatfile_btc_hourly_closes as download_btc_hourly,
+    download_flatfile_stock_day_closes as download_equity_closes,
+)
 from research.plotting import apply_default_style
 
 load_dotenv(dotenv_path=".env")
@@ -52,12 +54,12 @@ apply_default_style()
 # %% [markdown]
 # ## Assumptions
 #
-# - QQQ and UPRO daily closes from Massive's adjusted aggregate endpoint
+# - QQQ and UPRO daily closes from Massive US stock day-aggregate flat files
 #   represent executable 4pm New York equity closes.
 # - BTC trades continuously. The BTC price aligned to an equity session is the
 #   latest available completed hourly X:BTC-USD close at or before that
-#   session's 4pm New York close. Massive hourly bars are relabeled from
-#   interval start to interval close before alignment.
+#   session's 4pm New York close. Hourly series is built from Massive crypto
+#   minute flat files, then aligned the same way as the prior REST hourly feed.
 # - A signal observed at today's equity close is implemented at that close and
 #   earns the following close-to-close UPRO return.
 # - The beta estimate uses the most recent aligned BTC and QQQ returns available
@@ -67,8 +69,8 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Massive REST aggregates for QQQ and UPRO daily closes.
-# - Massive REST aggregates for X:BTC-USD hourly closes.
+# - Massive S3 flat files: `us_stocks_sip/day_aggs_v1` for QQQ and UPRO daily OHLC.
+# - Massive S3 flat files: global crypto `minute_aggs_v1` for X:BTC-USD, resampled to hourly.
 
 # %%
 START_DATE = "2023-01-01"
@@ -86,189 +88,6 @@ WALK_FORWARD_ENTRY_ZSCORE_GRID = [1.0, 1.5, 2.0]
 WALK_FORWARD_TRAIN_DAYS = 252
 WALK_FORWARD_TEST_DAYS = 63
 WALK_FORWARD_MIN_TRAIN_ACTIVE_DAYS = 5
-NY_TZ = ZoneInfo("America/New_York")
-MASSIVE_API_BASE_URL = "https://api.massive.com"
-MASSIVE_API_KEY_ENV = "MASSIVE_API_KEY"
-MASSIVE_REQUEST_DELAY_SECONDS = float(os.getenv("MASSIVE_REQUEST_DELAY_SECONDS", "65"))
-MASSIVE_MAX_RETRIES = int(os.getenv("MASSIVE_MAX_RETRIES", "4"))
-_LAST_MASSIVE_REQUEST_AT = 0.0
-
-
-def get_massive_api_key() -> str:
-    """Read the Massive API key from the environment or a local .env file."""
-    api_key = os.getenv(MASSIVE_API_KEY_ENV)
-    if not api_key:
-        raise ValueError(
-            f"Set {MASSIVE_API_KEY_ENV} in the environment or a local .env file "
-            "before running this notebook."
-        )
-    return api_key
-
-
-def wait_for_massive_rate_limit() -> None:
-    """Space Massive calls to avoid low request-per-minute plan limits in CI."""
-    global _LAST_MASSIVE_REQUEST_AT
-
-    if MASSIVE_REQUEST_DELAY_SECONDS <= 0 or _LAST_MASSIVE_REQUEST_AT <= 0:
-        return
-
-    elapsed = time.monotonic() - _LAST_MASSIVE_REQUEST_AT
-    remaining = MASSIVE_REQUEST_DELAY_SECONDS - elapsed
-    if remaining > 0:
-        time.sleep(remaining)
-
-
-def request_massive_url(
-    ticker: str,
-    url: str,
-    params: dict[str, object],
-) -> requests.Response:
-    """Request a Massive URL with pacing and explicit 429 retry handling."""
-    global _LAST_MASSIVE_REQUEST_AT
-
-    for attempt in range(MASSIVE_MAX_RETRIES + 1):
-        wait_for_massive_rate_limit()
-        response = requests.get(url, params=params, timeout=30)
-        _LAST_MASSIVE_REQUEST_AT = time.monotonic()
-
-        if response.status_code != 429:
-            return response
-
-        if attempt == MASSIVE_MAX_RETRIES:
-            return response
-
-        retry_after = response.headers.get("Retry-After")
-        try:
-            retry_delay = float(retry_after) if retry_after else MASSIVE_REQUEST_DELAY_SECONDS
-        except ValueError:
-            retry_delay = MASSIVE_REQUEST_DELAY_SECONDS
-        time.sleep(max(retry_delay, MASSIVE_REQUEST_DELAY_SECONDS))
-
-    raise RuntimeError(f"Massive aggregate request for {ticker} failed unexpectedly.")
-
-
-def request_massive_aggregates(
-    ticker: str,
-    multiplier: int,
-    timespan: str,
-    start_date: str,
-    end_date: str,
-    *,
-    adjusted: bool = True,
-) -> pd.DataFrame:
-    """Download Massive aggregate bars, following pagination when needed."""
-    api_key = get_massive_api_key()
-    url = (
-        f"{MASSIVE_API_BASE_URL}/v2/aggs/ticker/{ticker}/range/"
-        f"{multiplier}/{timespan}/{start_date}/{end_date}"
-    )
-    params = {
-        "adjusted": str(adjusted).lower(),
-        "sort": "asc",
-        "limit": 50_000,
-        "apiKey": api_key,
-    }
-    rows: list[dict] = []
-
-    while url:
-        response = request_massive_url(ticker, url, params)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Massive aggregate request for {ticker} failed with "
-                f"HTTP {response.status_code}: {response.text[:300]}"
-            )
-
-        payload = response.json()
-        rows.extend(payload.get("results", []))
-        next_url = payload.get("next_url")
-        url = next_url if next_url else ""
-        params = {"apiKey": api_key} if next_url else {}
-
-    if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-    frame = pd.DataFrame.from_records(rows)
-    frame["timestamp"] = pd.to_datetime(frame["t"], unit="ms", utc=True)
-    frame = frame.set_index("timestamp").sort_index()
-    return frame.rename(
-        columns={
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume",
-            "vw": "vwap",
-            "n": "transactions",
-        }
-    )
-
-
-def download_equity_closes(
-    tickers: list[str],
-    start_date: str,
-    end_date: str,
-) -> pd.DataFrame:
-    """Download Massive adjusted daily equity closes."""
-    close_series = {}
-    for ticker in tickers:
-        bars = request_massive_aggregates(
-            ticker,
-            multiplier=1,
-            timespan="day",
-            start_date=start_date,
-            end_date=end_date,
-            adjusted=True,
-        )
-        closes = bars["close"].dropna()
-        closes.index = closes.index.tz_convert(NY_TZ).tz_localize(None).normalize()
-        close_series[ticker] = closes.rename(ticker)
-
-    return pd.concat(close_series.values(), axis=1).sort_index().dropna(how="all")
-
-
-def download_btc_hourly(start_date: str, end_date: str) -> pd.Series:
-    """Download Massive hourly BTC-USD closes for equity-close alignment."""
-    bars = request_massive_aggregates(
-        "X:BTC-USD",
-        multiplier=1,
-        timespan="hour",
-        start_date=start_date,
-        end_date=end_date,
-        adjusted=True,
-    )
-    closes = bars["close"].dropna()
-    if closes.empty:
-        return closes
-
-    # Massive aggregate timestamps mark the interval start. Relabel to the
-    # completed hourly close so a 4pm equity close never sees a future BTC bar.
-    closes.index = closes.index + pd.Timedelta(hours=1)
-    return closes.loc[closes.index >= pd.Timestamp(start_date, tz="UTC")]
-
-
-def build_equity_close_times(equity_dates: pd.Index) -> pd.Series:
-    """Map each equity trading date to 4pm New York time in UTC."""
-    close_times = []
-    for session_date in pd.to_datetime(equity_dates).date:
-        close_time = datetime.combine(session_date, datetime.min.time(), NY_TZ)
-        close_time = close_time.replace(hour=16)
-        close_times.append(pd.Timestamp(close_time).tz_convert("UTC"))
-
-    return pd.Series(close_times, index=pd.to_datetime(equity_dates), name="equity_close_utc")
-
-
-def align_btc_to_equity_close(
-    btc_hourly_close: pd.Series,
-    equity_close_times: pd.Series,
-) -> pd.Series:
-    """Sample BTC at the latest completed hourly close at or before each equity close."""
-    aligned = btc_hourly_close.reindex(
-        pd.DatetimeIndex(equity_close_times),
-        method="ffill",
-        tolerance=pd.Timedelta(minutes=1),
-    )
-    aligned.index = equity_close_times.index
-    return aligned.rename("btc_close_at_equity_close")
 
 
 def rolling_beta(y: pd.Series, x: pd.Series, lookback: int) -> pd.Series:
@@ -1199,8 +1018,8 @@ plt.show()
 # %% [markdown]
 # ## Limitations
 #
-# - Massive hourly BTC bars align cleanly to the 4pm New York equity close, but
-#   exchange-specific tick or minute data would still capture more precise marks.
+# - BTC hourly marks are derived from Massive crypto minute flat files; raw
+#   tick or sub-minute data would still capture more precise marks.
 # - The backtest assumes closing-price execution for UPRO, no spread/slippage, no
 #   borrow or financing effects, and no tax impact.
 # - UPRO is a 3x S&P 500 ETF, not a Nasdaq ETF. If the intended instrument is
@@ -1222,7 +1041,7 @@ plt.show()
 #
 # ## Next Research Ideas
 #
-# - Compare hourly BTC marks with Massive minute bars or exchange tick data
+# - Compare resampled hourly BTC with exchange tick or sub-minute marks
 #   sampled exactly at 4pm New York.
 # - Compare UPRO with TQQQ and QQQ to separate leverage effects from index choice.
 # - Try alternative walk-forward objective functions such as Sortino ratio,

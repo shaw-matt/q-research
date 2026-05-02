@@ -58,9 +58,9 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Massive daily close data for SPY and TLT via `research.data`.
-# - Massive daily QQQ/UPRO and hourly X:BTC-USD for the UPRO residual signal via
-#   `research.upro_residual`.
+# - Massive S3 flat files (US stock day aggregates) via `research.data`.
+# - Massive S3 flat files for QQQ/UPRO daily and crypto minute BTC for the UPRO
+#   residual signal via `research.upro_residual`.
 
 # %%
 START_DATE = "2004-01-01"
