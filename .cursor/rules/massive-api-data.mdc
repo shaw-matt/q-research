@@ -16,8 +16,8 @@ Agents must use Massive API for market data in this repository.
   `MASSIVE_SECRET_KEY`, or standard `AWS_*`) with `MASSIVE_FILES_ENDPOINT`
   defaulting to `https://files.massive.com`. Optional: `MASSIVE_FLATFILE_BUCKET`,
   `MASSIVE_S3_ADDRESSING_STYLE` (`path` vs `virtual`), `AWS_REGION`.
-  If S3 is missing or returns 403, notebooks fall back to REST using
-  `MASSIVE_API_KEY` (e.g. grouped daily stocks endpoint). Never hard-code keys.
+  Do not fall back to Massive REST for market OHLC when flat files are required.
+  Never hard-code keys.
 - When aligning prices across instruments or asset classes, prefer Massive
   timestamped aggregate bars at the finest practical granularity for the
   research question, then document the timestamp convention and alignment rule

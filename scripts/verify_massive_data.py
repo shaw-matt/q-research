@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Massive data access: S3 flat files first, then REST grouped daily."""
+"""Verify Massive S3 flat-file access for US stock day aggregates."""
 
 from __future__ import annotations
 
@@ -24,18 +24,22 @@ def main() -> int:
         probe_day -= timedelta(days=1)
 
     client = get_massive_flatfile_s3_client()
-    if client:
-        keys = probe_stock_flatfile_keys(probe_day)
-        if keys:
-            print("S3 flat files: OK for", probe_day.isoformat(), "via", keys[0])
-        else:
-            print(
-                "S3 flat files: no readable object for",
-                probe_day.isoformat(),
-                "(check keys, bucket, MASSIVE_FILES_ENDPOINT, MASSIVE_S3_ADDRESSING_STYLE)",
-            )
+    if not client:
+        print(
+            "FAIL: S3 credentials not set. Set MASSIVE_S3_ACCESS_KEY_ID and "
+            "MASSIVE_S3_SECRET_ACCESS_KEY (or MASSIVE_ACCESS_KEY / MASSIVE_SECRET_KEY / AWS_*)."
+        )
+        return 1
+
+    keys = probe_stock_flatfile_keys(probe_day)
+    if keys:
+        print("S3 flat files: OK for", probe_day.isoformat(), "via", keys[0])
     else:
-        print("S3: credentials not set (MASSIVE_S3_* / MASSIVE_ACCESS_KEY / AWS_*)")
+        print(
+            "S3: no readable day-aggregate object for",
+            probe_day.isoformat(),
+            "(check bucket, MASSIVE_FILES_ENDPOINT, MASSIVE_S3_ADDRESSING_STYLE, subscription)",
+        )
 
     try:
         df = download_flatfile_stock_day_closes(
@@ -47,7 +51,7 @@ def main() -> int:
     if df.empty:
         print("FAIL: download_flatfile_stock_day_closes returned empty.")
         return 1
-    print("Combined download: OK", df.shape, list(df.columns))
+    print("download_flatfile_stock_day_closes: OK", df.shape, list(df.columns))
     return 0
 
 

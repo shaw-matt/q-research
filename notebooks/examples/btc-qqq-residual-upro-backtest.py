@@ -59,7 +59,7 @@ apply_default_style()
 # - BTC trades continuously. The BTC price aligned to an equity session is the
 #   latest available completed hourly X:BTC-USD close at or before that
 #   session's 4pm New York close. Hourly series is built from Massive crypto
-#   minute flat files, then aligned the same way as the prior REST hourly feed.
+#   minute flat files, then aligned to equity closes the same way as before.
 # - A signal observed at today's equity close is implemented at that close and
 #   earns the following close-to-close UPRO return.
 # - The beta estimate uses the most recent aligned BTC and QQQ returns available

@@ -25,7 +25,7 @@ def get_massive_flatfile_s3_client():
     """
     S3-compatible client for Massive flat files.
 
-    Returns None if access keys are not set (callers may use REST fallback).
+    Returns None if access keys are not set.
     Also accepts Massive gist env names: MASSIVE_ACCESS_KEY / MASSIVE_SECRET_KEY.
     """
     access = (
@@ -58,6 +58,17 @@ def get_massive_flatfile_s3_client():
             read_timeout=120,
         ),
     )
+
+
+def _require_s3_client():
+    client = get_massive_flatfile_s3_client()
+    if client is None:
+        raise ValueError(
+            "Massive flat files require S3 credentials: set MASSIVE_S3_ACCESS_KEY_ID and "
+            "MASSIVE_S3_SECRET_ACCESS_KEY (or MASSIVE_ACCESS_KEY / MASSIVE_SECRET_KEY, or "
+            "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)."
+        )
+    return client
 
 
 def _read_s3_gzip_csv(client, bucket: str, key: str) -> pd.DataFrame | None:
@@ -139,22 +150,20 @@ def download_flatfile_stock_day_closes(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    """
-    Load daily equity closes: try S3 flat files first, then REST grouped daily (one request per day).
-    """
+    """Load daily equity closes from Massive S3 flat files only (US stock day aggregates)."""
     tickers_u = [t.upper() for t in tickers]
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
 
-    client = get_massive_flatfile_s3_client()
-    if client is not None:
-        wide = _download_stock_days_s3(client, _flatfiles_bucket(), tickers_u, start, end)
-        if not wide.empty:
-            return wide
-
-    from research.massive_rest import download_grouped_daily_stock_closes
-
-    return download_grouped_daily_stock_closes(tickers_u, start_date, end_date)
+    client = _require_s3_client()
+    wide = _download_stock_days_s3(client, _flatfiles_bucket(), tickers_u, start, end)
+    if wide.empty:
+        raise ValueError(
+            f"No US stock day-aggregate rows found for {tickers_u} between {start_date} and {end_date}. "
+            "Confirm flat-file subscription, S3 credentials, MASSIVE_FILES_ENDPOINT, "
+            "MASSIVE_FLATFILE_BUCKET, and MASSIVE_S3_ADDRESSING_STYLE (path vs virtual)."
+        )
+    return wide
 
 
 def _download_btc_hourly_s3(client, bucket: str, start: date, end: date, start_date: str) -> pd.Series:
@@ -187,19 +196,19 @@ def _download_btc_hourly_s3(client, bucket: str, start: date, end: date, start_d
 
 
 def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Series:
-    """Hourly BTC: crypto minute flat files if S3 works, else REST hourly aggregates."""
+    """Build hourly BTC-USD closes from global crypto minute flat files only."""
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
 
-    client = get_massive_flatfile_s3_client()
-    if client is not None:
-        series = _download_btc_hourly_s3(client, _flatfiles_bucket(), start, end, start_date)
-        if not series.empty:
-            return series
-
-    from research.massive_rest import download_ticker_hourly_crypto_closes
-
-    return download_ticker_hourly_crypto_closes("X:BTC-USD", start_date, end_date)
+    client = _require_s3_client()
+    series = _download_btc_hourly_s3(client, _flatfiles_bucket(), start, end, start_date)
+    if series.empty:
+        raise ValueError(
+            f"No crypto minute flat-file bars for X:BTC-USD between {start_date} and {end_date}. "
+            "Confirm flat-file subscription, S3 credentials, and key prefix "
+            "(global_crypto/minute_aggs_v1 or crypto/minute_aggs_v1)."
+        )
+    return series
 
 
 def build_equity_close_times(equity_dates: pd.Index) -> pd.Series:
