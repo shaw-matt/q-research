@@ -17,12 +17,13 @@
 #
 # ## Research Question
 #
-# If we combine the three SPY/TLT signal ideas into a single portfolio, can
-# optimized weights plus a volatility target improve risk-adjusted performance?
+# If we combine the SPY/TLT calendar and relative-value signals with the
+# BTC/QQQ residual long-UPRO rule into one portfolio, can optimized weights
+# plus a volatility target improve risk-adjusted performance?
 #
 # ## Hypothesis
 #
-# The three signals likely have different timing and risk profiles. A
+# The four signals likely have different timing and risk profiles. A
 # constrained optimized blend should diversify signal noise, and a volatility
 # target should stabilize drawdowns and annualized risk.
 
@@ -32,21 +33,25 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from scipy.optimize import minimize
 
 from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
+from research.upro_residual import build_upro_residual_strategy_returns
 
+load_dotenv(dotenv_path=".env")
 apply_default_style()
 
 # %% [markdown]
 # ## Assumptions
 #
 # - All signals use daily close data and trade on the next close-to-close return.
-# - The three strategies are:
+# - The four strategies are:
 #   1. End-of-month SPY/TLT laggard rotation from trading day 15.
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
+#   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
 # - Weight optimization is done in-sample only, then evaluated out-of-sample.
 # - Vol targeting uses rolling realized volatility and next-day scaling.
 # - Transaction costs, slippage, borrow costs, and financing are excluded.
@@ -54,6 +59,8 @@ apply_default_style()
 # ## Data Sources
 #
 # - Massive daily close data for SPY and TLT via `research.data`.
+# - Massive daily QQQ/UPRO and hourly X:BTC-USD for the UPRO residual signal via
+#   `research.upro_residual`.
 
 # %%
 START_DATE = "2004-01-01"
@@ -65,6 +72,9 @@ MAX_LEVERAGE = 2.5
 EOM_TRIGGER_DAY = 15
 RELATIVE_REVERSAL_LOOKBACK = 5
 TURN_OF_MONTH_WINDOW = 5
+BETA_LOOKBACK_DAYS = 40
+ZSCORE_LOOKBACK_DAYS = 20
+ENTRY_ZSCORE = 1.5
 
 
 def max_drawdown(return_series: pd.Series) -> float:
@@ -222,25 +232,37 @@ prices = download_massive_daily_closes(["SPY", "TLT"], start_date=START_DATE).dr
 if prices.empty:
     raise ValueError("No SPY/TLT daily prices were downloaded.")
 
-signal_returns = pd.concat(
+spy_tlt_returns = pd.concat(
     [
         build_eom_rebalance_returns(prices, trigger_day=EOM_TRIGGER_DAY),
         build_relative_reversal_returns(prices, lookback_days=RELATIVE_REVERSAL_LOOKBACK),
         build_turn_of_month_tlt_returns(prices, window_days=TURN_OF_MONTH_WINDOW),
     ],
     axis=1,
-).dropna()
+)
+
+upro_returns = build_upro_residual_strategy_returns(
+    start_date=START_DATE,
+    beta_lookback=BETA_LOOKBACK_DAYS,
+    zscore_lookback=ZSCORE_LOOKBACK_DAYS,
+    entry_zscore=ENTRY_ZSCORE,
+)
+
+signal_returns = spy_tlt_returns.join(upro_returns, how="inner").dropna()
+if signal_returns.empty:
+    raise ValueError("No overlapping history after joining SPY/TLT signals with UPRO residual.")
 signal_returns.tail(10)
 
 # %% [markdown]
 # ## Methodology
 #
-# 1. Build daily return streams for the three existing signal rules.
-# 2. Split the sample into train (first 60%) and test (last 40%).
-# 3. Optimize non-negative weights that sum to one to maximize train Sharpe.
-# 4. Apply optimized static weights to create blended portfolio returns.
-# 5. Vol-target the blended portfolio using rolling 20-day realized volatility.
-# 6. Compare equal-weight, optimized, and optimized-plus-vol-targeted variants.
+# 1. Build daily return streams for the three SPY/TLT rules and the UPRO residual rule.
+# 2. Inner-join on dates so all legs are defined (sample starts when UPRO/BTC data allow).
+# 3. Split the sample into train (first 60%) and test (last 40%).
+# 4. Optimize non-negative weights that sum to one to maximize train Sharpe.
+# 5. Apply optimized static weights to create blended portfolio returns.
+# 6. Vol-target the blended portfolio using rolling 20-day realized volatility.
+# 7. Compare equal-weight, optimized, and optimized-plus-vol-targeted variants.
 
 # %% [markdown]
 # ## Analysis
@@ -384,12 +406,14 @@ plt.show()
 # - This notebook uses static optimized weights, not dynamic re-optimization.
 # - Vol-target scaling uses historical realized volatility and may lag shocks.
 # - Costs, turnover drag, and implementation constraints are not modeled.
+# - The inner join with the UPRO residual leg shortens the combined sample to
+#   dates where QQQ, UPRO, BTC, SPY, and TLT history all overlap.
 #
 # ## Conclusion
 #
-# This notebook backtests a combined portfolio of the three SPY/TLT signals,
-# compares equal-weight versus optimized blending, and evaluates a volatility
-# targeting overlay on the optimized mix.
+# This notebook backtests a combined portfolio of the three SPY/TLT signals
+# plus the BTC/QQQ residual UPRO rule, compares equal-weight versus optimized
+# blending, and evaluates a volatility targeting overlay on the optimized mix.
 #
 # ## Next Research Ideas
 #
