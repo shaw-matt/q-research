@@ -14,45 +14,72 @@ from botocore.exceptions import ClientError
 from zoneinfo import ZoneInfo
 
 NY_TZ = ZoneInfo("America/New_York")
-FLATFILES_BUCKET = "flatfiles"
 DEFAULT_FILES_ENDPOINT = "https://files.massive.com"
 
 
+def _flatfiles_bucket() -> str:
+    return os.getenv("MASSIVE_FLATFILE_BUCKET", "flatfiles")
+
+
 def get_massive_flatfile_s3_client():
-    """S3-compatible client for Massive flat files (separate S3 keys from REST API key)."""
-    access = os.getenv("MASSIVE_S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
-    secret = os.getenv("MASSIVE_S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    """
+    S3-compatible client for Massive flat files.
+
+    Returns None if access keys are not set (callers may use REST fallback).
+    Also accepts Massive gist env names: MASSIVE_ACCESS_KEY / MASSIVE_SECRET_KEY.
+    """
+    access = (
+        os.getenv("MASSIVE_S3_ACCESS_KEY_ID")
+        or os.getenv("MASSIVE_ACCESS_KEY")
+        or os.getenv("AWS_ACCESS_KEY_ID")
+    )
+    secret = (
+        os.getenv("MASSIVE_S3_SECRET_ACCESS_KEY")
+        or os.getenv("MASSIVE_SECRET_KEY")
+        or os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
     if not access or not secret:
-        raise ValueError(
-            "Set MASSIVE_S3_ACCESS_KEY_ID and MASSIVE_S3_SECRET_ACCESS_KEY with your Massive "
-            "flat-file S3 credentials (from the Massive dashboard), or set AWS_ACCESS_KEY_ID "
-            "and AWS_SECRET_ACCESS_KEY to the same values."
-        )
+        return None
+
     endpoint = os.getenv("MASSIVE_FILES_ENDPOINT", DEFAULT_FILES_ENDPOINT).rstrip("/")
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+    addressing = os.getenv("MASSIVE_S3_ADDRESSING_STYLE", "path")
+
     return boto3.client(
         "s3",
+        region_name=region,
         aws_access_key_id=access,
         aws_secret_access_key=secret,
         endpoint_url=endpoint,
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": addressing},
+            connect_timeout=15,
+            read_timeout=120,
+        ),
     )
 
 
-def _read_s3_gzip_csv(client, key: str) -> pd.DataFrame | None:
+def _read_s3_gzip_csv(client, bucket: str, key: str) -> pd.DataFrame | None:
     try:
-        response = client.get_object(Bucket=FLATFILES_BUCKET, Key=key)
+        response = client.get_object(Bucket=bucket, Key=key)
         raw = response["Body"].read()
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey", "NotFound"):
+        # Wrong path often returns 403 (no ListBucket) instead of 404.
+        if code in ("404", "NoSuchKey", "NotFound", "403", "AccessDenied"):
             return None
         raise
     with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
         return pd.read_csv(gz)
 
 
-def _stock_day_agg_key(day: date) -> str:
-    return f"us_stocks_sip/day_aggs_v1/{day.year}/{day.month:02d}/{day.isoformat()}.csv.gz"
+def _stock_day_agg_key_candidates(day: date) -> list[str]:
+    y, m, ds = day.year, day.month, day.isoformat()
+    return [
+        f"us_stocks_sip/day_aggs_v1/{y}/{m:02d}/{ds}.csv.gz",
+        f"us_stocks_sip/day_aggs_v1/{y}/{ds}.csv.gz",
+    ]
 
 
 def _crypto_minute_agg_keys(day: date) -> list[str]:
@@ -63,27 +90,30 @@ def _crypto_minute_agg_keys(day: date) -> list[str]:
     ]
 
 
-def download_flatfile_stock_day_closes(
-    tickers: list[str],
-    start_date: str,
-    end_date: str,
-) -> pd.DataFrame:
-    """
-    Load adjusted daily equity closes from per-day US stock day-aggregate flat files.
+def _load_stock_day_from_s3(client, bucket: str, day: date) -> pd.DataFrame | None:
+    for key in _stock_day_agg_key_candidates(day):
+        df = _read_s3_gzip_csv(client, bucket, key)
+        if df is not None and not df.empty:
+            return df
+    return None
 
-    One S3 GET per calendar day in range (missing weekends/holidays return no object).
-    """
-    tickers_u = [t.upper() for t in tickers]
+
+def _download_stock_days_s3(
+    client,
+    bucket: str,
+    tickers_u: list[str],
+    start: date,
+    end: date,
+) -> pd.DataFrame:
     want = set(tickers_u)
-    start = pd.Timestamp(start_date).date()
-    end = pd.Timestamp(end_date).date()
-    client = get_massive_flatfile_s3_client()
     records: list[dict[str, object]] = []
 
     for ts in pd.date_range(start, end, freq="D"):
         day = ts.date()
-        df = _read_s3_gzip_csv(client, _stock_day_agg_key(day))
+        df = _load_stock_day_from_s3(client, bucket, day)
         if df is None or df.empty:
+            continue
+        if "ticker" not in df.columns or "close" not in df.columns:
             continue
         sub = df.loc[df["ticker"].isin(want), ["ticker", "window_start", "close"]]
         if sub.empty:
@@ -101,27 +131,40 @@ def download_flatfile_stock_day_closes(
         return pd.DataFrame()
 
     frame = pd.DataFrame.from_records(records)
-    wide = frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
-    return wide
+    return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
 
 
-def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Series:
+def download_flatfile_stock_day_closes(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
     """
-    Build hourly BTC-USD closes from global crypto minute-aggregate flat files.
-
-    Matches REST behavior: bar timestamps mark interval start; relabel to interval end,
-    then aggregate minutes to hourly closes (UTC).
+    Load daily equity closes: try S3 flat files first, then REST grouped daily (one request per day).
     """
+    tickers_u = [t.upper() for t in tickers]
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
+
     client = get_massive_flatfile_s3_client()
+    if client is not None:
+        wide = _download_stock_days_s3(client, _flatfiles_bucket(), tickers_u, start, end)
+        if not wide.empty:
+            return wide
+
+    from research.massive_rest import download_grouped_daily_stock_closes
+
+    return download_grouped_daily_stock_closes(tickers_u, start_date, end_date)
+
+
+def _download_btc_hourly_s3(client, bucket: str, start: date, end: date, start_date: str) -> pd.Series:
     chunks: list[pd.DataFrame] = []
 
     for ts in pd.date_range(start, end, freq="D"):
         day = ts.date()
         df = None
         for key in _crypto_minute_agg_keys(day):
-            df = _read_s3_gzip_csv(client, key)
+            df = _read_s3_gzip_csv(client, bucket, key)
             if df is not None and not df.empty:
                 break
         if df is None or df.empty:
@@ -141,6 +184,22 @@ def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Se
     minute_close = minute_close[~minute_close.index.duplicated(keep="last")]
     hourly = minute_close.resample("1h", label="right", closed="right").last().dropna()
     return hourly.loc[hourly.index >= pd.Timestamp(start_date, tz="UTC")]
+
+
+def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Series:
+    """Hourly BTC: crypto minute flat files if S3 works, else REST hourly aggregates."""
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+
+    client = get_massive_flatfile_s3_client()
+    if client is not None:
+        series = _download_btc_hourly_s3(client, _flatfiles_bucket(), start, end, start_date)
+        if not series.empty:
+            return series
+
+    from research.massive_rest import download_ticker_hourly_crypto_closes
+
+    return download_ticker_hourly_crypto_closes("X:BTC-USD", start_date, end_date)
 
 
 def build_equity_close_times(equity_dates: pd.Index) -> pd.Series:
@@ -166,3 +225,17 @@ def align_btc_to_equity_close(
     )
     aligned.index = equity_close_times.index
     return aligned.rename("btc_close_at_equity_close")
+
+
+def probe_stock_flatfile_keys(day: date) -> list[str]:
+    """Return S3 keys that successfully download for ``day`` (for debugging)."""
+    client = get_massive_flatfile_s3_client()
+    if client is None:
+        return []
+    bucket = _flatfiles_bucket()
+    ok: list[str] = []
+    for key in _stock_day_agg_key_candidates(day):
+        df = _read_s3_gzip_csv(client, bucket, key)
+        if df is not None and not df.empty:
+            ok.append(key)
+    return ok
