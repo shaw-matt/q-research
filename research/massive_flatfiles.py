@@ -13,6 +13,8 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 from zoneinfo import ZoneInfo
 
+from research import flatfile_cache
+
 NY_TZ = ZoneInfo("America/New_York")
 DEFAULT_FILES_ENDPOINT = "https://files.massive.com"
 
@@ -156,14 +158,41 @@ def download_flatfile_stock_day_closes(
     end = pd.Timestamp(end_date).date()
 
     client = _require_s3_client()
-    wide = _download_stock_days_s3(client, _flatfiles_bucket(), tickers_u, start, end)
-    if wide.empty:
+    bucket = _flatfiles_bucket()
+    cache_path = flatfile_cache.stock_cache_path(tickers_u, start)
+
+    cached: pd.DataFrame | None = None
+    if flatfile_cache.enabled():
+        cached = flatfile_cache.try_load_stock_frame(cache_path, tickers_u)
+
+    ranges = flatfile_cache.stock_ranges_to_download(cached, start, end)
+    pieces: list[pd.DataFrame] = []
+    for range_start, range_end in ranges:
+        part = _download_stock_days_s3(client, bucket, tickers_u, range_start, range_end)
+        if not part.empty:
+            pieces.append(part)
+    if cached is not None and not cached.empty:
+        pieces.append(cached)
+
+    wide_full = flatfile_cache.merge_stock_frames(pieces)
+    if wide_full.empty:
         raise ValueError(
             f"No US stock day-aggregate rows found for {tickers_u} between {start_date} and {end_date}. "
             "Confirm flat-file subscription, S3 credentials, MASSIVE_FILES_ENDPOINT, "
             "MASSIVE_FLATFILE_BUCKET, and MASSIVE_S3_ADDRESSING_STYLE (path vs virtual)."
         )
-    return wide
+    wide_full = wide_full.sort_index()
+    wide_full.index = pd.to_datetime(wide_full.index).normalize()
+    wide_full = wide_full[[t for t in tickers_u if t in wide_full.columns]]
+
+    out = wide_full.loc[
+        (wide_full.index >= pd.Timestamp(start)) & (wide_full.index <= pd.Timestamp(end)),
+        :,
+    ]
+    if flatfile_cache.enabled():
+        flatfile_cache.save_stock_frame(cache_path, wide_full, tickers_u)
+
+    return out
 
 
 def _download_btc_hourly_s3(client, bucket: str, start: date, end: date, start_date: str) -> pd.Series:
@@ -201,14 +230,33 @@ def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Se
     end = pd.Timestamp(end_date).date()
 
     client = _require_s3_client()
-    series = _download_btc_hourly_s3(client, _flatfiles_bucket(), start, end, start_date)
-    if series.empty:
+    bucket = _flatfiles_bucket()
+    cache_path = flatfile_cache.btc_cache_path(start_date)
+
+    cached: pd.Series | None = None
+    if flatfile_cache.enabled():
+        cached = flatfile_cache.try_load_btc_series(cache_path)
+
+    ranges = flatfile_cache.btc_ranges_to_download(cached, start, end)
+    parts: list[pd.Series] = []
+    for range_start, range_end in ranges:
+        part = _download_btc_hourly_s3(client, bucket, range_start, range_end, start_date)
+        if not part.empty:
+            parts.append(part)
+    if cached is not None and not cached.empty:
+        parts.append(cached)
+
+    merged = flatfile_cache.merge_btc_series(parts)
+    if merged.empty:
         raise ValueError(
             f"No crypto minute flat-file bars for X:BTC-USD between {start_date} and {end_date}. "
             "Confirm flat-file subscription, S3 credentials, and key prefix "
             "(global_crypto/minute_aggs_v1 or crypto/minute_aggs_v1)."
         )
-    return series
+    merged = merged.loc[merged.index >= pd.Timestamp(start_date, tz="UTC")]
+    if flatfile_cache.enabled():
+        flatfile_cache.save_btc_series(cache_path, merged)
+    return merged
 
 
 def build_equity_close_times(equity_dates: pd.Index) -> pd.Series:

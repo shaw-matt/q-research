@@ -34,6 +34,18 @@ jobs:
           fi
       - uses: actions/checkout@v4
         if: env.SHOULD_PUBLISH == 'true'
+      - name: Massive flat-file cache id
+        if: env.SHOULD_PUBLISH == 'true'
+        id: cache-week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        if: env.SHOULD_PUBLISH == 'true'
+        with:
+          path: .cache/q-research
+          key: massive-flatfiles-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ steps.cache-week.outputs.week }}
+          restore-keys: |
+            massive-flatfiles-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+            massive-flatfiles-${{ runner.os }}-
       - uses: quarto-dev/quarto-actions/setup@v2
         if: env.SHOULD_PUBLISH == 'true'
       - uses: astral-sh/setup-uv@v5

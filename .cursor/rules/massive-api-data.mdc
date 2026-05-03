@@ -11,6 +11,9 @@ Agents must use Massive API for market data in this repository.
   third-party market data fetches unless the user explicitly requests that
   provider for the task.
 - Read Massive credentials from environment or an ignored local `.env` file.
+- Flat-file downloads are cached on disk under `.cache/q-research/flatfiles` (override with
+  `Q_RESEARCH_FLATFILE_CACHE_DIR`). Disable with `Q_RESEARCH_FLATFILE_CACHE=0`. Incremental
+  fetches only fill missing calendar ranges when extending history or refreshing through today.
   Flat-file (S3) access uses `MASSIVE_S3_ACCESS_KEY_ID` and
   `MASSIVE_S3_SECRET_ACCESS_KEY` (aliases `MASSIVE_ACCESS_KEY` /
   `MASSIVE_SECRET_KEY`, or standard `AWS_*`) with `MASSIVE_FILES_ENDPOINT`
