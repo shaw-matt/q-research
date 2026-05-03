@@ -21,6 +21,12 @@ Agents must use Massive API for market data in this repository.
   `MASSIVE_S3_ADDRESSING_STYLE` (`path` vs `virtual`), `AWS_REGION`.
   Do not fall back to Massive REST for market OHLC when flat files are required.
   Never hard-code keys.
+- **Split in this repo:** Quarto notebooks / backtests use **S3 flat files** only
+  (``research.massive_flatfiles``). The daily export script
+  ``scripts/export_equal_weight_portfolio_weights.py`` defaults to **REST**
+  (``research.massive_rest``, ``MASSIVE_API_KEY`` or ``POLYGON_API_KEY``, optional
+  ``MASSIVE_REST_URL`` defaulting to ``https://api.massive.com``). Use
+  ``--data-source s3`` on that script only for parity with research.
 - When aligning prices across instruments or asset classes, prefer Massive
   timestamped aggregate bars at the finest practical granularity for the
   research question, then document the timestamp convention and alignment rule

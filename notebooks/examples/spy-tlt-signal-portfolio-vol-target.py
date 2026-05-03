@@ -21,6 +21,11 @@
 # BTC/QQQ residual long-UPRO rule into one portfolio, can optimized weights
 # plus a volatility target improve risk-adjusted performance?
 #
+# **Production default:** equal-weight blending across the four signals (each
+# leg receives `1/4` of capital). In-sample results here often favor that simple
+# mix over optimized weights; daily weights for hand trading are exported with
+# `scripts/export_equal_weight_portfolio_weights.py`.
+#
 # ## Hypothesis
 #
 # The four signals likely have different timing and risk profiles. A
@@ -30,16 +35,22 @@
 # %%
 from __future__ import annotations
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from scipy.optimize import minimize
 
-from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
+from research.signal_portfolio_blend import (
+    SignalPortfolioParams,
+    blend_signal_exposures,
+    build_signal_portfolio_bundle,
+    equal_blend_weights,
+    gross_exposure_shares,
+)
 from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
-from research.upro_residual import build_upro_residual_strategy_frame
 
 load_dotenv(dotenv_path=".env")
 apply_default_style()
@@ -146,142 +157,6 @@ def optimize_sharpe_weights(returns_frame: pd.DataFrame) -> pd.Series:
     return pd.Series(result.x, index=assets, name="weight")
 
 
-def build_eom_rebalance_returns(
-    prices: pd.DataFrame, trigger_day: int = 15
-) -> tuple[pd.Series, pd.DataFrame]:
-    frame = prices.copy()
-    frame["month"] = frame.index.to_period("M")
-    frame["day_in_month"] = frame.groupby("month").cumcount() + 1
-    frame["SPY_mtd"] = frame.groupby("month")["SPY"].transform(lambda s: s / s.iloc[0] - 1)
-    frame["TLT_mtd"] = frame.groupby("month")["TLT"].transform(lambda s: s / s.iloc[0] - 1)
-
-    trigger = frame["day_in_month"] == trigger_day
-    frame["signal_asset"] = pd.Series(index=frame.index, dtype="object")
-    frame.loc[trigger & (frame["SPY_mtd"] > frame["TLT_mtd"]), "signal_asset"] = "TLT"
-    frame.loc[trigger & (frame["TLT_mtd"] > frame["SPY_mtd"]), "signal_asset"] = "SPY"
-    frame["signal_asset"] = frame.groupby("month")["signal_asset"].transform("first")
-    frame["is_last_day"] = frame["day_in_month"] == frame.groupby("month")["day_in_month"].transform("max")
-
-    frame["position_asset"] = pd.Series(index=frame.index, dtype="object")
-    active_window = (frame["day_in_month"] > trigger_day) & ~frame["is_last_day"]
-    frame.loc[active_window, "position_asset"] = frame.loc[active_window, "signal_asset"]
-
-    frame["SPY_return"] = frame["SPY"].pct_change()
-    frame["TLT_return"] = frame["TLT"].pct_change()
-    frame["strategy_return"] = np.where(
-        frame["position_asset"] == "SPY",
-        frame["SPY_return"],
-        np.where(frame["position_asset"] == "TLT", frame["TLT_return"], 0.0),
-    )
-    exposure = pd.DataFrame(
-        {
-            "SPY": (frame["position_asset"] == "SPY").astype(float),
-            "TLT": (frame["position_asset"] == "TLT").astype(float),
-            "UPRO": 0.0,
-        },
-        index=frame.index,
-    )
-    return frame["strategy_return"].rename("eom_rebalance"), exposure
-
-
-def build_relative_reversal_returns(
-    prices: pd.DataFrame, lookback_days: int = 5
-) -> tuple[pd.Series, pd.DataFrame]:
-    frame = prices.copy()
-    frame["SPY_return"] = frame["SPY"].pct_change()
-    frame["TLT_return"] = frame["TLT"].pct_change()
-    frame["log_ratio"] = np.log(frame["SPY"] / frame["TLT"])
-    frame["log_ratio_ma"] = frame["log_ratio"].rolling(lookback_days).mean()
-    frame["signal_asset"] = np.where(frame["log_ratio"] < frame["log_ratio_ma"], "SPY", "TLT")
-    frame["position_asset"] = frame["signal_asset"].shift(1)
-    frame["strategy_return"] = np.where(
-        frame["position_asset"] == "SPY",
-        frame["SPY_return"],
-        np.where(frame["position_asset"] == "TLT", frame["TLT_return"], np.nan),
-    )
-    exposure = pd.DataFrame(
-        {
-            "SPY": (frame["position_asset"] == "SPY").astype(float),
-            "TLT": (frame["position_asset"] == "TLT").astype(float),
-            "UPRO": 0.0,
-        },
-        index=frame.index,
-    )
-    return frame["strategy_return"].rename("relative_reversal"), exposure
-
-
-def build_turn_of_month_tlt_returns(
-    prices: pd.DataFrame, window_days: int = 5
-) -> tuple[pd.Series, pd.DataFrame]:
-    frame = prices.copy()
-    frame["month"] = frame.index.to_period("M")
-    frame["day_in_month"] = frame.groupby("month").cumcount() + 1
-    frame["days_in_month"] = frame.groupby("month")["day_in_month"].transform("max")
-    frame["days_to_month_end"] = frame["days_in_month"] - frame["day_in_month"] + 1
-
-    month_num = frame["month"].dt.month
-    next_month_num = frame["month"].shift(-1).dt.month
-    is_month_end = month_num != next_month_num
-
-    frame["position_signal"] = 0
-    frame.loc[frame["days_to_month_end"] <= window_days, "position_signal"] = 1
-    frame.loc[frame["day_in_month"] <= window_days, "position_signal"] = -1
-    frame.loc[is_month_end, "position_signal"] = -1
-
-    frame["TLT_return"] = frame["TLT"].pct_change()
-    frame["position"] = frame["position_signal"].shift(1).fillna(0)
-    frame["strategy_return"] = frame["position"] * frame["TLT_return"]
-    exposure = pd.DataFrame(
-        {
-            "SPY": 0.0,
-            "TLT": frame["position"].astype(float),
-            "UPRO": 0.0,
-        },
-        index=frame.index,
-    )
-    return frame["strategy_return"].rename("tlt_turn_of_month"), exposure
-
-
-def blend_signal_exposures(
-    per_signal: pd.DataFrame,
-    blend_weights: pd.Series,
-) -> pd.DataFrame:
-    """Net SPY / TLT / UPRO weights per $1 of blended signal capital (pre vol overlay)."""
-    assets = ["SPY", "TLT", "UPRO"]
-    out = pd.DataFrame(0.0, index=per_signal.index, columns=assets)
-    for sig in blend_weights.index:
-        w = float(blend_weights[sig])
-        for a in assets:
-            out[a] = out[a] + w * per_signal[(sig, a)]
-    return out
-
-
-def gross_exposure_shares(net: pd.DataFrame) -> pd.DataFrame:
-    """100% stacked shares: SPY long, TLT long, TLT short, UPRO long, cash/flat."""
-    spy = net["SPY"]
-    tlt = net["TLT"]
-    upro = net["UPRO"]
-    c_spy = spy.clip(lower=0.0)
-    c_tlt_long = tlt.clip(lower=0.0)
-    c_tlt_short = (-tlt).clip(lower=0.0)
-    c_upro = upro.clip(lower=0.0)
-    gross = c_spy + c_tlt_long + c_tlt_short + c_upro
-    denom = gross.replace(0.0, np.nan)
-    parts = pd.DataFrame(
-        {
-            "SPY": (c_spy / denom).fillna(0.0),
-            "TLT long": (c_tlt_long / denom).fillna(0.0),
-            "TLT short": (c_tlt_short / denom).fillna(0.0),
-            "UPRO": (c_upro / denom).fillna(0.0),
-        },
-        index=net.index,
-    )
-    cash = (gross <= 0.0).astype(float)
-    parts = parts.mul((gross > 0.0).astype(float), axis=0)
-    parts["Cash / flat"] = cash
-    return parts
-
-
 def plot_exposure_mix(ax, shares: pd.DataFrame, title: str) -> None:
     idx = shares.index
     series = [shares[c].to_numpy() for c in shares.columns]
@@ -290,7 +165,12 @@ def plot_exposure_mix(ax, shares: pd.DataFrame, title: str) -> None:
     ax.set_ylabel("Share of gross exposure")
     ax.set_xlabel("Date")
     ax.set_ylim(0.0, 1.0)
-    ax.margins(x=0)
+    ax.margins(x=0.02)
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=14)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.tick_params(axis="x", labelsize=9)
+    plt.setp(ax.get_xticklabels(), rotation=28, ha="right")
     ax.legend(loc="upper left", fontsize=8)
 
 
@@ -311,47 +191,18 @@ def apply_vol_target(
     return frame
 
 
-prices = download_massive_daily_closes(["SPY", "TLT"], start_date=START_DATE).dropna()
-if prices.empty:
-    raise ValueError("No SPY/TLT daily prices were downloaded.")
-
-eom_ret, eom_exp = build_eom_rebalance_returns(prices, trigger_day=EOM_TRIGGER_DAY)
-rel_ret, rel_exp = build_relative_reversal_returns(prices, lookback_days=RELATIVE_REVERSAL_LOOKBACK)
-tom_ret, tom_exp = build_turn_of_month_tlt_returns(prices, window_days=TURN_OF_MONTH_WINDOW)
-spy_tlt_returns = pd.concat([eom_ret, rel_ret, tom_ret], axis=1)
-
-upro_frame = build_upro_residual_strategy_frame(
+_portfolio_params = SignalPortfolioParams(
     start_date=START_DATE,
-    beta_lookback=BETA_LOOKBACK_DAYS,
-    zscore_lookback=ZSCORE_LOOKBACK_DAYS,
+    eom_trigger_day=EOM_TRIGGER_DAY,
+    relative_reversal_lookback=RELATIVE_REVERSAL_LOOKBACK,
+    turn_of_month_window=TURN_OF_MONTH_WINDOW,
+    beta_lookback_days=BETA_LOOKBACK_DAYS,
+    zscore_lookback_days=ZSCORE_LOOKBACK_DAYS,
     entry_zscore=ENTRY_ZSCORE,
 )
-upro_returns = upro_frame["strategy_return"].rename("upro_residual")
-
-signal_returns = spy_tlt_returns.join(upro_returns, how="inner").dropna()
-if signal_returns.empty:
-    raise ValueError("No overlapping history after joining SPY/TLT signals with UPRO residual.")
-
-_signal_cols = list(signal_returns.columns)
-per_signal_exposure = pd.concat(
-    [
-        eom_exp.reindex(signal_returns.index).fillna(0.0),
-        rel_exp.reindex(signal_returns.index).fillna(0.0),
-        tom_exp.reindex(signal_returns.index).fillna(0.0),
-        pd.DataFrame(
-            {
-                "SPY": 0.0,
-                "TLT": 0.0,
-                "UPRO": upro_frame["upro_exposure"]
-                .reindex(signal_returns.index)
-                .fillna(0.0),
-            },
-            index=signal_returns.index,
-        ),
-    ],
-    axis=1,
-    keys=_signal_cols,
-)
+_bundle = build_signal_portfolio_bundle(_portfolio_params)
+signal_returns = _bundle.signal_returns
+per_signal_exposure = _bundle.per_signal_exposure
 signal_returns.tail(10)
 
 # %% [markdown]
@@ -364,6 +215,9 @@ signal_returns.tail(10)
 # 5. Apply optimized static weights to create blended portfolio returns.
 # 6. Vol-target the blended portfolio using rolling 20-day realized volatility.
 # 7. Compare equal-weight, optimized, and optimized-plus-vol-targeted variants.
+# 8. Export equal-weight implied ETF weights for production with
+#    `scripts/export_equal_weight_portfolio_weights.py` (shared pipeline in
+#    `research.signal_portfolio_blend`).
 
 # %% [markdown]
 # ## Analysis
@@ -374,11 +228,7 @@ train_returns = signal_returns.iloc[:split_idx]
 test_returns = signal_returns.iloc[split_idx:]
 
 optimized_weights = optimize_sharpe_weights(train_returns)
-equal_weights = pd.Series(
-    np.repeat(1 / signal_returns.shape[1], signal_returns.shape[1]),
-    index=signal_returns.columns,
-    name="weight",
-)
+equal_weights = equal_blend_weights(signal_returns)
 
 weight_table = pd.concat([equal_weights.rename("equal_weight"), optimized_weights.rename("optimized_weight")], axis=1)
 weight_table
@@ -505,14 +355,16 @@ net_optimized_plot = net_optimized.reindex(portfolio_returns.index).fillna(0.0)
 shares_equal = gross_exposure_shares(net_equal_plot)
 shares_optimized = gross_exposure_shares(net_optimized_plot)
 
-fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 plot_exposure_mix(axes[0], shares_equal, "Equal-weight signals — implied ETF mix (% of gross exposure)")
 plot_exposure_mix(
     axes[1],
     shares_optimized,
     "Optimized signals — implied ETF mix (vol-target variant uses this same mix)",
 )
-plt.tight_layout()
+axes[0].tick_params(axis="x", labelbottom=False)
+axes[0].set_xlabel("")
+fig.subplots_adjust(hspace=0.22, bottom=0.14, left=0.07, right=0.98)
 plt.show()
 
 # %%
@@ -563,6 +415,9 @@ plt.show()
 # This notebook backtests a combined portfolio of the three SPY/TLT signals
 # plus the BTC/QQQ residual UPRO rule, compares equal-weight versus optimized
 # blending, and evaluates a volatility targeting overlay on the optimized mix.
+# For execution, prefer the **equal-weight** blend unless out-of-sample metrics
+# justify optimization; export daily weights with
+# `uv run python scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Next Research Ideas
 #

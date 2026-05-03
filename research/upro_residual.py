@@ -1,6 +1,9 @@
-"""BTC/QQQ residual z-score long UPRO strategy (Massive flat-file data)."""
+"""BTC/QQQ residual z-score long UPRO strategy (Massive flat-file or REST data)."""
 
 from __future__ import annotations
+
+from datetime import UTC
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -27,16 +30,29 @@ def build_upro_residual_strategy_frame(
     beta_lookback: int = 40,
     zscore_lookback: int = 20,
     entry_zscore: float = 1.5,
+    data_source: Literal["s3", "rest"] = "s3",
 ) -> pd.DataFrame:
     """
     Strategy returns plus 0/1 UPRO exposure (same index as ``strategy_return``).
 
     Long UPRO when the prior close had residual z-score >= ``entry_zscore``.
-    """
-    end = pd.Timestamp.today(tz="UTC").date().isoformat() if end_date is None else end_date
 
-    equity_closes = download_flatfile_stock_day_closes(["QQQ", "UPRO"], start_date, end)
-    btc_hourly = download_flatfile_btc_hourly_closes(start_date, end)
+    Use ``data_source="s3"`` for backtests (flat files). Use ``data_source="rest"`` for
+    live exports via Massive REST (``MASSIVE_API_KEY``).
+    """
+    end = pd.Timestamp.now(tz=UTC).date().isoformat() if end_date is None else end_date
+
+    if data_source == "rest":
+        from research.massive_rest import (
+            download_rest_crypto_hourly_closes,
+            download_rest_stock_day_closes,
+        )
+
+        equity_closes = download_rest_stock_day_closes(["QQQ", "UPRO"], start_date, end)
+        btc_hourly = download_rest_crypto_hourly_closes("X:BTC-USD", start_date, end)
+    else:
+        equity_closes = download_flatfile_stock_day_closes(["QQQ", "UPRO"], start_date, end)
+        btc_hourly = download_flatfile_btc_hourly_closes(start_date, end)
     if equity_closes.empty or btc_hourly.empty:
         raise ValueError("Missing QQQ/UPRO or BTC-USD data for UPRO residual signal.")
 
@@ -82,6 +98,7 @@ def build_upro_residual_strategy_returns(
     beta_lookback: int = 40,
     zscore_lookback: int = 20,
     entry_zscore: float = 1.5,
+    data_source: Literal["s3", "rest"] = "s3",
 ) -> pd.Series:
     """
     Daily strategy returns: long UPRO when prior close had residual z-score >= entry.
@@ -95,5 +112,6 @@ def build_upro_residual_strategy_returns(
         beta_lookback=beta_lookback,
         zscore_lookback=zscore_lookback,
         entry_zscore=entry_zscore,
+        data_source=data_source,
     )
     return frame["strategy_return"].rename("upro_residual")
