@@ -35,12 +35,19 @@
 # %%
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from scipy.optimize import minimize
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from research.plotting import apply_default_style
 from research.signal_portfolio_blend import (
@@ -52,7 +59,7 @@ from research.signal_portfolio_blend import (
 )
 from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
 
-load_dotenv(dotenv_path=".env")
+load_dotenv(dotenv_path=_REPO_ROOT / ".env")
 apply_default_style()
 
 # %% [markdown]
@@ -200,7 +207,7 @@ _portfolio_params = SignalPortfolioParams(
     zscore_lookback_days=ZSCORE_LOOKBACK_DAYS,
     entry_zscore=ENTRY_ZSCORE,
 )
-_bundle = build_signal_portfolio_bundle(_portfolio_params)
+_bundle = build_signal_portfolio_bundle(_portfolio_params, data_source="s3")
 signal_returns = _bundle.signal_returns
 per_signal_exposure = _bundle.per_signal_exposure
 signal_returns.tail(10)
