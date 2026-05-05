@@ -19,7 +19,7 @@ Before pushing notebook changes, run:
 
 ```bash
 uv sync
-QUARTO_PYTHON=.venv/bin/python quarto render
+uv run python scripts/render_notebooks.py
 ```
 
 Do not push if the render fails.
@@ -34,8 +34,11 @@ uv run jupyter lab
 ## Render Site
 
 ```bash
-QUARTO_PYTHON=.venv/bin/python quarto render
+uv run python scripts/render_notebooks.py
 ```
+
+Set `Q_RESEARCH_NOTEBOOK_RENDER_JOBS` or pass `--jobs` to control the number of
+parallel notebook renders.
 
 ## Create a New Notebook
 
