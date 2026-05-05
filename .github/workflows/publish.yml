@@ -58,7 +58,7 @@ jobs:
         if: env.SHOULD_PUBLISH == 'true'
       - run: uv run python -m ipykernel install --user --name python3 --display-name "Python 3"
         if: env.SHOULD_PUBLISH == 'true'
-      - run: uv run quarto render
+      - run: uv run python scripts/render_notebooks.py
         if: env.SHOULD_PUBLISH == 'true'
         env:
           PYTHONPATH: ${{ github.workspace }}

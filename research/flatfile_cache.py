@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -28,6 +29,23 @@ def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _atomic_parquet_write(frame: pd.DataFrame, path: Path) -> None:
+    _ensure_dir(path)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+    try:
+        frame.to_parquet(temp_path)
+        temp_path.replace(path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def stock_cache_path(tickers_u: list[str], start: date) -> Path:
     slug = "+".join(sorted(tickers_u))
     return cache_root() / f"stock_day_{slug}_{start.isoformat()}.parquet"
@@ -51,11 +69,10 @@ def try_load_stock_frame(path: Path, tickers_u: list[str]) -> pd.DataFrame | Non
 
 
 def save_stock_frame(path: Path, frame: pd.DataFrame, tickers_u: list[str]) -> None:
-    _ensure_dir(path)
     out = frame.sort_index()
     out.index = pd.to_datetime(out.index).normalize()
     out = out[[c for c in tickers_u if c in out.columns]]
-    out.to_parquet(path)
+    _atomic_parquet_write(out, path)
 
 
 def btc_cache_path(start_date: str) -> Path:
@@ -80,13 +97,12 @@ def try_load_btc_series(path: Path) -> pd.Series | None:
 
 
 def save_btc_series(path: Path, series: pd.Series) -> None:
-    _ensure_dir(path)
     s = series.sort_index()
     if s.index.tz is None:
         s.index = s.index.tz_localize("UTC")
     else:
         s.index = s.index.tz_convert("UTC")
-    s.to_frame(name="close").to_parquet(path)
+    _atomic_parquet_write(s.to_frame(name="close"), path)
 
 
 def merge_stock_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:

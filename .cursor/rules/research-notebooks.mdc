@@ -32,7 +32,7 @@ Before pushing, run:
 
 ```bash
 uv sync
-QUARTO_PYTHON=.venv/bin/python quarto render
+uv run python scripts/render_notebooks.py
 ```
 
 Do not push if rendering fails. Fix the notebook or project config first.
