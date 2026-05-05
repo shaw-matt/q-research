@@ -5,6 +5,8 @@ from __future__ import annotations
 import gzip
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import date, datetime
 
 import boto3
@@ -17,10 +19,21 @@ from research import flatfile_cache
 
 NY_TZ = ZoneInfo("America/New_York")
 DEFAULT_FILES_ENDPOINT = "https://files.massive.com"
+DEFAULT_DOWNLOAD_WORKERS = 8
 
 
 def _flatfiles_bucket() -> str:
     return os.getenv("MASSIVE_FLATFILE_BUCKET", "flatfiles")
+
+
+def _download_workers() -> int:
+    raw = os.getenv("Q_RESEARCH_FLATFILE_DOWNLOAD_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return DEFAULT_DOWNLOAD_WORKERS
+    return DEFAULT_DOWNLOAD_WORKERS
 
 
 def get_massive_flatfile_s3_client():
@@ -58,6 +71,7 @@ def get_massive_flatfile_s3_client():
             s3={"addressing_style": addressing},
             connect_timeout=15,
             read_timeout=120,
+            max_pool_connections=max(10, _download_workers()),
         ),
     )
 
@@ -119,18 +133,17 @@ def _download_stock_days_s3(
     end: date,
 ) -> pd.DataFrame:
     want = set(tickers_u)
-    records: list[dict[str, object]] = []
 
-    for ts in pd.date_range(start, end, freq="D"):
-        day = ts.date()
+    def load_day(day: date) -> list[dict[str, object]]:
         df = _load_stock_day_from_s3(client, bucket, day)
         if df is None or df.empty:
-            continue
+            return []
         if "ticker" not in df.columns or "close" not in df.columns:
-            continue
+            return []
         sub = df.loc[df["ticker"].isin(want), ["ticker", "window_start", "close"]]
         if sub.empty:
-            continue
+            return []
+        records: list[dict[str, object]] = []
         for ticker in tickers_u:
             rows = sub.loc[sub["ticker"] == ticker]
             if rows.empty:
@@ -139,6 +152,19 @@ def _download_stock_days_s3(
             bar_start = pd.Timestamp(int(row["window_start"]), unit="ns", tz="UTC")
             session = bar_start.tz_convert("America/New_York").normalize().tz_localize(None)
             records.append({"date": session, "ticker": ticker, "close": float(row["close"])})
+        return records
+
+    days = [ts.date() for ts in pd.date_range(start, end, freq="D")]
+    records: list[dict[str, object]] = []
+    worker_count = min(_download_workers(), len(days) or 1)
+    if worker_count == 1:
+        for day in days:
+            records.extend(load_day(day))
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(load_day, day) for day in days]
+            for future in as_completed(futures):
+                records.extend(future.result())
 
     if not records:
         return pd.DataFrame()
@@ -157,61 +183,75 @@ def download_flatfile_stock_day_closes(
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
 
-    client = _require_s3_client()
-    bucket = _flatfiles_bucket()
     cache_path = flatfile_cache.stock_cache_path(tickers_u, start)
+    use_cache = flatfile_cache.enabled()
 
-    cached: pd.DataFrame | None = None
-    if flatfile_cache.enabled():
-        cached = flatfile_cache.try_load_stock_frame(cache_path, tickers_u)
+    with flatfile_cache.exclusive_cache_lock(cache_path) if use_cache else nullcontext():
+        cached: pd.DataFrame | None = None
+        if use_cache:
+            cached = flatfile_cache.try_load_stock_frame(cache_path, tickers_u)
 
-    ranges = flatfile_cache.stock_ranges_to_download(cached, start, end)
-    pieces: list[pd.DataFrame] = []
-    for range_start, range_end in ranges:
-        part = _download_stock_days_s3(client, bucket, tickers_u, range_start, range_end)
-        if not part.empty:
-            pieces.append(part)
-    if cached is not None and not cached.empty:
-        pieces.append(cached)
+        ranges = flatfile_cache.stock_ranges_to_download(cached, start, end)
+        pieces: list[pd.DataFrame] = []
+        if ranges:
+            client = _require_s3_client()
+            bucket = _flatfiles_bucket()
+            for range_start, range_end in ranges:
+                part = _download_stock_days_s3(client, bucket, tickers_u, range_start, range_end)
+                if not part.empty:
+                    pieces.append(part)
+        if cached is not None and not cached.empty:
+            pieces.append(cached)
 
-    wide_full = flatfile_cache.merge_stock_frames(pieces)
-    if wide_full.empty:
-        raise ValueError(
-            f"No US stock day-aggregate rows found for {tickers_u} between {start_date} and {end_date}. "
-            "Confirm flat-file subscription, S3 credentials, MASSIVE_FILES_ENDPOINT, "
-            "MASSIVE_FLATFILE_BUCKET, and MASSIVE_S3_ADDRESSING_STYLE (path vs virtual)."
-        )
-    wide_full = wide_full.sort_index()
-    wide_full.index = pd.to_datetime(wide_full.index).normalize()
-    wide_full = wide_full[[t for t in tickers_u if t in wide_full.columns]]
+        wide_full = flatfile_cache.merge_stock_frames(pieces)
+        if wide_full.empty:
+            raise ValueError(
+                f"No US stock day-aggregate rows found for {tickers_u} between {start_date} and {end_date}. "
+                "Confirm flat-file subscription, S3 credentials, MASSIVE_FILES_ENDPOINT, "
+                "MASSIVE_FLATFILE_BUCKET, and MASSIVE_S3_ADDRESSING_STYLE (path vs virtual)."
+            )
+        wide_full = wide_full.sort_index()
+        wide_full.index = pd.to_datetime(wide_full.index).normalize()
+        wide_full = wide_full[[t for t in tickers_u if t in wide_full.columns]]
 
-    out = wide_full.loc[
-        (wide_full.index >= pd.Timestamp(start)) & (wide_full.index <= pd.Timestamp(end)),
-        :,
-    ]
-    if flatfile_cache.enabled():
-        flatfile_cache.save_stock_frame(cache_path, wide_full, tickers_u)
+        out = wide_full.loc[
+            (wide_full.index >= pd.Timestamp(start)) & (wide_full.index <= pd.Timestamp(end)),
+            :,
+        ]
+        if use_cache and ranges:
+            flatfile_cache.save_stock_frame(cache_path, wide_full, tickers_u)
 
     return out
 
 
 def _download_btc_hourly_s3(client, bucket: str, start: date, end: date, start_date: str) -> pd.Series:
-    chunks: list[pd.DataFrame] = []
-
-    for ts in pd.date_range(start, end, freq="D"):
-        day = ts.date()
+    def load_day(day: date) -> pd.DataFrame | None:
         df = None
         for key in _crypto_minute_agg_keys(day):
             df = _read_s3_gzip_csv(client, bucket, key)
             if df is not None and not df.empty:
                 break
         if df is None or df.empty:
-            continue
+            return None
         mask = df["ticker"].isin(["X:BTC-USD", "X:BTCUSD"])
         sub = df.loc[mask, ["window_start", "close"]]
         if sub.empty:
-            continue
-        chunks.append(sub)
+            return None
+        return sub
+
+    days = [ts.date() for ts in pd.date_range(start, end, freq="D")]
+    chunks: list[pd.DataFrame] = []
+    worker_count = min(_download_workers(), len(days) or 1)
+    if worker_count == 1:
+        for day in days:
+            if (chunk := load_day(day)) is not None:
+                chunks.append(chunk)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(load_day, day) for day in days]
+            for future in as_completed(futures):
+                if (chunk := future.result()) is not None:
+                    chunks.append(chunk)
 
     if not chunks:
         return pd.Series(dtype=float)
@@ -229,33 +269,36 @@ def download_flatfile_btc_hourly_closes(start_date: str, end_date: str) -> pd.Se
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
 
-    client = _require_s3_client()
-    bucket = _flatfiles_bucket()
     cache_path = flatfile_cache.btc_cache_path(start_date)
+    use_cache = flatfile_cache.enabled()
 
-    cached: pd.Series | None = None
-    if flatfile_cache.enabled():
-        cached = flatfile_cache.try_load_btc_series(cache_path)
+    with flatfile_cache.exclusive_cache_lock(cache_path) if use_cache else nullcontext():
+        cached: pd.Series | None = None
+        if use_cache:
+            cached = flatfile_cache.try_load_btc_series(cache_path)
 
-    ranges = flatfile_cache.btc_ranges_to_download(cached, start, end)
-    parts: list[pd.Series] = []
-    for range_start, range_end in ranges:
-        part = _download_btc_hourly_s3(client, bucket, range_start, range_end, start_date)
-        if not part.empty:
-            parts.append(part)
-    if cached is not None and not cached.empty:
-        parts.append(cached)
+        ranges = flatfile_cache.btc_ranges_to_download(cached, start, end)
+        parts: list[pd.Series] = []
+        if ranges:
+            client = _require_s3_client()
+            bucket = _flatfiles_bucket()
+            for range_start, range_end in ranges:
+                part = _download_btc_hourly_s3(client, bucket, range_start, range_end, start_date)
+                if not part.empty:
+                    parts.append(part)
+        if cached is not None and not cached.empty:
+            parts.append(cached)
 
-    merged = flatfile_cache.merge_btc_series(parts)
-    if merged.empty:
-        raise ValueError(
-            f"No crypto minute flat-file bars for X:BTC-USD between {start_date} and {end_date}. "
-            "Confirm flat-file subscription, S3 credentials, and key prefix "
-            "(global_crypto/minute_aggs_v1 or crypto/minute_aggs_v1)."
-        )
-    merged = merged.loc[merged.index >= pd.Timestamp(start_date, tz="UTC")]
-    if flatfile_cache.enabled():
-        flatfile_cache.save_btc_series(cache_path, merged)
+        merged = flatfile_cache.merge_btc_series(parts)
+        if merged.empty:
+            raise ValueError(
+                f"No crypto minute flat-file bars for X:BTC-USD between {start_date} and {end_date}. "
+                "Confirm flat-file subscription, S3 credentials, and key prefix "
+                "(global_crypto/minute_aggs_v1 or crypto/minute_aggs_v1)."
+            )
+        merged = merged.loc[merged.index >= pd.Timestamp(start_date, tz="UTC")]
+        if use_cache and ranges:
+            flatfile_cache.save_btc_series(cache_path, merged)
     return merged
 
 

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - GitHub Actions runs on Linux.
+    fcntl = None
 
 
 def enabled() -> bool:
@@ -29,6 +35,23 @@ def _ensure_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+@contextmanager
+def exclusive_cache_lock(path: Path):
+    """Serialize writers for a cache file across parallel notebook renders."""
+    if fcntl is None:
+        yield
+        return
+
+    lock_path = path.with_suffix(f"{path.suffix}.lock")
+    _ensure_dir(lock_path)
+    with lock_path.open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_parquet_write(frame: pd.DataFrame, path: Path) -> None:
     _ensure_dir(path)
     with tempfile.NamedTemporaryFile(
@@ -46,14 +69,7 @@ def _atomic_parquet_write(frame: pd.DataFrame, path: Path) -> None:
         raise
 
 
-def stock_cache_path(tickers_u: list[str], start: date) -> Path:
-    slug = "+".join(sorted(tickers_u))
-    return cache_root() / f"stock_day_{slug}_{start.isoformat()}.parquet"
-
-
-def try_load_stock_frame(path: Path, tickers_u: list[str]) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
+def _load_stock_cache_file(path: Path, tickers_u: list[str]) -> pd.DataFrame | None:
     try:
         frame = pd.read_parquet(path)
     except (OSError, ValueError):
@@ -65,7 +81,33 @@ def try_load_stock_frame(path: Path, tickers_u: list[str]) -> pd.DataFrame | Non
     missing = [t for t in tickers_u if t not in frame.columns]
     if missing:
         return None
-    return frame
+    return frame[[*tickers_u]]
+
+
+def stock_cache_path(tickers_u: list[str], start: date) -> Path:
+    slug = "+".join(sorted(tickers_u))
+    return cache_root() / f"stock_day_{slug}_{start.isoformat()}.parquet"
+
+
+def try_load_stock_frame(path: Path, tickers_u: list[str]) -> pd.DataFrame | None:
+    candidates = [path]
+    if path.parent.exists():
+        candidates.extend(
+            candidate
+            for candidate in sorted(path.parent.glob("stock_day_*.parquet"))
+            if candidate != path
+        )
+
+    frames = [
+        frame
+        for candidate in candidates
+        if (frame := _load_stock_cache_file(candidate, tickers_u)) is not None
+    ]
+    if not frames:
+        return None
+    out = pd.concat(frames, axis=0).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out[[*tickers_u]]
 
 
 def save_stock_frame(path: Path, frame: pd.DataFrame, tickers_u: list[str]) -> None:
