@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 from research.data import download_massive_daily_closes
-from research.plotting import apply_default_style
+from research.plotting import apply_default_style, plot_time_series_with_start_slider
 from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
 
 apply_default_style()
@@ -196,22 +196,29 @@ by_month.tail(12)
 strategy_curve = (1 + analysis["strategy_return"]).cumprod()
 tlt_curve = (1 + analysis["TLT_return"]).cumprod()
 
-fig, ax = plt.subplots()
-strategy_curve.plot(ax=ax, label="Turn-of-month strategy")
-tlt_curve.plot(ax=ax, label="TLT buy and hold", alpha=0.75)
-ax.set_title("Equity Curves")
-ax.set_xlabel("Date")
-ax.set_ylabel("Growth of $1")
-ax.legend()
-plt.show()
+fig = plot_time_series_with_start_slider(
+    pd.DataFrame(
+        {
+            "strategy": strategy_curve,
+            "tlt": tlt_curve,
+        }
+    ),
+    title="Equity Curves",
+    yaxis_title="Growth of $1",
+    labels={
+        "strategy": "Turn-of-month strategy",
+        "tlt": "TLT buy and hold",
+    },
+)
+fig.show()
 
 # %%
-fig, ax = plt.subplots()
-analysis["position"].plot(ax=ax, linewidth=1)
-ax.set_title("Position Timeline (+1 long, -1 short, 0 flat)")
-ax.set_xlabel("Date")
-ax.set_ylabel("Position")
-plt.show()
+fig = plot_time_series_with_start_slider(
+    analysis["position"],
+    title="Position Timeline (+1 long, -1 short, 0 flat)",
+    yaxis_title="Position",
+)
+fig.show()
 
 # %%
 fig, ax = plt.subplots()

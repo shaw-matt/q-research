@@ -30,12 +30,11 @@
 # %%
 from __future__ import annotations
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from research.data import download_massive_daily_closes
-from research.plotting import apply_default_style
+from research.plotting import apply_default_style, plot_time_series_with_start_slider
 from research.stats import (
     annualized_turnover_one_way,
     mean_daily_turnover_one_way,
@@ -203,15 +202,23 @@ equity_curve = (1 + analysis["strategy_return"]).cumprod()
 spy_curve = (1 + analysis["SPY_return"].fillna(0)).cumprod()
 tlt_curve = (1 + analysis["TLT_return"].fillna(0)).cumprod()
 
-fig, ax = plt.subplots()
-equity_curve.plot(ax=ax, label="EOM rebalance strategy")
-spy_curve.plot(ax=ax, label="SPY buy and hold", alpha=0.75)
-tlt_curve.plot(ax=ax, label="TLT buy and hold", alpha=0.75)
-ax.set_title("Equity Curves")
-ax.set_xlabel("Date")
-ax.set_ylabel("Growth of $1")
-ax.legend()
-plt.show()
+fig = plot_time_series_with_start_slider(
+    pd.DataFrame(
+        {
+            "strategy": equity_curve,
+            "spy": spy_curve,
+            "tlt": tlt_curve,
+        }
+    ),
+    title="Equity Curves",
+    yaxis_title="Growth of $1",
+    labels={
+        "strategy": "EOM rebalance strategy",
+        "spy": "SPY buy and hold",
+        "tlt": "TLT buy and hold",
+    },
+)
+fig.show()
 
 # %%
 fig, ax = plt.subplots()
