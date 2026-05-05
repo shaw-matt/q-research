@@ -38,8 +38,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -53,7 +51,11 @@ else:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from research.plotting import apply_default_style
+from research.plotting import (
+    apply_default_style,
+    plot_stacked_area_with_start_slider,
+    plot_time_series_with_start_slider,
+)
 from research.signal_portfolio_blend import (
     SignalPortfolioParams,
     blend_signal_exposures,
@@ -166,23 +168,6 @@ def optimize_sharpe_weights(returns_frame: pd.DataFrame) -> pd.Series:
     if not result.success:
         raise RuntimeError(f"Weight optimization failed: {result.message}")
     return pd.Series(result.x, index=assets, name="weight")
-
-
-def plot_exposure_mix(ax, shares: pd.DataFrame, title: str) -> None:
-    idx = shares.index
-    series = [shares[c].to_numpy() for c in shares.columns]
-    ax.stackplot(idx, *series, labels=shares.columns, alpha=0.88)
-    ax.set_title(title)
-    ax.set_ylabel("Share of gross exposure")
-    ax.set_xlabel("Date")
-    ax.set_ylim(0.0, 1.0)
-    ax.margins(x=0.02)
-    locator = mdates.AutoDateLocator(minticks=6, maxticks=14)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    ax.tick_params(axis="x", labelsize=9)
-    plt.setp(ax.get_xticklabels(), rotation=28, ha="right")
-    ax.legend(loc="upper left", fontsize=8)
 
 
 def apply_vol_target(
@@ -340,19 +325,17 @@ vol_target_diagnostics
 
 # %%
 equity_curves = (1 + portfolio_returns).cumprod()
-fig, ax = plt.subplots()
-equity_curves.plot(ax=ax)
-ax.set_title("Signal Portfolio Equity Curves")
-ax.set_xlabel("Date")
-ax.set_ylabel("Growth of $1")
-ax.legend(
-    [
-        "Equal-weight signals",
-        "Optimized signals",
-        "Optimized + vol target",
-    ]
+fig = plot_time_series_with_start_slider(
+    equity_curves,
+    title="Signal Portfolio Equity Curves",
+    yaxis_title="Growth of $1",
+    labels={
+        "equal_weight_return": "Equal-weight signals",
+        "optimized_return": "Optimized signals",
+        "optimized_vol_target_return": "Optimized + vol target",
+    },
 )
-plt.show()
+fig.show()
 
 # %%
 # Underlying ETF mix (per $1 of blended signal capital, before the vol overlay).
@@ -366,27 +349,28 @@ net_optimized_plot = net_optimized.reindex(portfolio_returns.index).fillna(0.0)
 shares_equal = gross_exposure_shares(net_equal_plot)
 shares_optimized = gross_exposure_shares(net_optimized_plot)
 
-fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-plot_exposure_mix(axes[0], shares_equal, "Equal-weight signals — implied ETF mix (% of gross exposure)")
-plot_exposure_mix(
-    axes[1],
-    shares_optimized,
-    "Optimized signals — implied ETF mix (vol-target variant uses this same mix)",
+fig = plot_stacked_area_with_start_slider(
+    {
+        "Equal-weight signals - implied ETF mix (% of gross exposure)": shares_equal,
+        "Optimized signals - implied ETF mix (vol-target variant uses this same mix)": shares_optimized,
+    },
+    title="Signal Portfolio Implied ETF Mix",
+    yaxis_title="Share of gross exposure",
 )
-axes[0].tick_params(axis="x", labelbottom=False)
-axes[0].set_xlabel("")
-fig.subplots_adjust(hspace=0.22, bottom=0.14, left=0.07, right=0.98)
-plt.show()
+fig.show()
 
 # %%
-fig, ax = plt.subplots()
-vol_target_frame["leverage"].reindex(portfolio_returns.index).plot(ax=ax, color="tab:purple")
-ax.axhline(1.0, color="black", linewidth=1, linestyle="--")
-ax.axhline(MAX_LEVERAGE, color="tab:red", linewidth=1, linestyle=":")
-ax.set_title("Applied Vol-Target Leverage")
-ax.set_xlabel("Date")
-ax.set_ylabel("Leverage multiple")
-plt.show()
+fig = plot_time_series_with_start_slider(
+    vol_target_frame["leverage"].reindex(portfolio_returns.index).rename("leverage"),
+    title="Applied Vol-Target Leverage",
+    yaxis_title="Leverage multiple",
+    labels={"leverage": "Applied leverage"},
+    horizontal_lines=[
+        {"y": 1.0, "color": "black", "dash": "dash", "label": "1.0x"},
+        {"y": MAX_LEVERAGE, "color": "red", "dash": "dot", "label": f"{MAX_LEVERAGE}x max"},
+    ],
+)
+fig.show()
 
 # %%
 rolling_window = 63
@@ -396,20 +380,18 @@ for column in portfolio_returns.columns:
     rolling_std = portfolio_returns[column].rolling(rolling_window).std()
     rolling_sharpes[column] = rolling_mean / rolling_std * np.sqrt(TRADING_DAYS_PER_YEAR)
 
-fig, ax = plt.subplots()
-rolling_sharpes.plot(ax=ax)
-ax.axhline(0, color="black", linewidth=1)
-ax.set_title(f"Rolling {rolling_window}-Day Sharpe")
-ax.set_xlabel("Date")
-ax.set_ylabel("Sharpe")
-ax.legend(
-    [
-        "Equal-weight signals",
-        "Optimized signals",
-        "Optimized + vol target",
-    ]
+fig = plot_time_series_with_start_slider(
+    rolling_sharpes,
+    title=f"Rolling {rolling_window}-Day Sharpe",
+    yaxis_title="Sharpe",
+    labels={
+        "equal_weight_return": "Equal-weight signals",
+        "optimized_return": "Optimized signals",
+        "optimized_vol_target_return": "Optimized + vol target",
+    },
+    horizontal_lines=[{"y": 0, "color": "black", "dash": "solid"}],
 )
-plt.show()
+fig.show()
 
 # %% [markdown]
 # ## Limitations
