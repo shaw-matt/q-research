@@ -45,7 +45,11 @@ import pandas as pd
 from dotenv import load_dotenv
 from scipy.optimize import minimize
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+if "__file__" in globals():
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+else:
+    _cwd = Path.cwd().resolve()
+    _REPO_ROOT = _cwd if (_cwd / "research").is_dir() else _cwd.parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
