@@ -46,11 +46,7 @@ from research.massive_flatfiles import (
     download_flatfile_btc_hourly_closes as download_btc_hourly,
     download_flatfile_stock_day_closes as download_equity_closes,
 )
-from research.plotting import (
-    apply_default_style,
-    plot_time_series_panels_with_start_slider,
-    plot_time_series_with_start_slider,
-)
+from research.plotting import apply_default_style
 from research.stats import annualized_turnover_one_way, mean_daily_turnover_one_way
 
 load_dotenv(dotenv_path=".env")
@@ -980,74 +976,65 @@ walk_forward_results.reindex(columns=walk_forward_window_summary_columns)
 
 # %%
 if not walk_forward_results.empty:
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
     plot_frame = walk_forward_results.set_index("test_start")
-    fig = plot_time_series_panels_with_start_slider(
-        {
-            "Selected beta lookback by walk-forward test window": plot_frame["beta_lookback"],
-            "Selected residual-volatility lookback": plot_frame["zscore_lookback"],
-            "Selected entry z-score": plot_frame["entry_zscore"],
-        },
-        title="Walk-Forward Selected Parameters",
-        yaxis_titles={
-            "Selected beta lookback by walk-forward test window": "Days",
-            "Selected residual-volatility lookback": "Days",
-            "Selected entry z-score": "Z-score",
-        },
-    )
-    fig.show()
+    plot_frame["beta_lookback"].plot(ax=axes[0], marker="o")
+    axes[0].set_title("Selected beta lookback by walk-forward test window")
+    axes[0].set_ylabel("Days")
+    plot_frame["zscore_lookback"].plot(ax=axes[1], marker="o", color="tab:orange")
+    axes[1].set_title("Selected residual-volatility lookback")
+    axes[1].set_ylabel("Days")
+    plot_frame["entry_zscore"].plot(ax=axes[2], marker="o", color="tab:green")
+    axes[2].set_title("Selected entry z-score")
+    axes[2].set_ylabel("Z-score")
+    axes[2].set_xlabel("Out-of-sample test start")
+    fig.tight_layout()
+    plt.show()
 
 # %% [markdown]
 # ## Visualizations
 
 # %%
-fig = plot_time_series_with_start_slider(
-    prices[["QQQ", "UPRO", "btc_close_at_equity_close"]].div(
-        prices[["QQQ", "UPRO", "btc_close_at_equity_close"]].iloc[0]
-    ),
-    title="Normalized QQQ, UPRO, and BTC-at-Equity-Close Prices",
-    yaxis_title="Growth of $1",
-    labels={"btc_close_at_equity_close": "BTC at equity close"},
-)
-fig.show()
+fig, ax = plt.subplots()
+prices[["QQQ", "UPRO", "btc_close_at_equity_close"]].div(
+    prices[["QQQ", "UPRO", "btc_close_at_equity_close"]].iloc[0]
+).plot(ax=ax)
+ax.set_title("Normalized QQQ, UPRO, and BTC-at-Equity-Close Prices")
+ax.set_xlabel("Date")
+ax.set_ylabel("Growth of $1")
+plt.show()
 
 # %%
-fig = plot_time_series_with_start_slider(
-    analysis["zscore"].rename("zscore"),
-    title="BTC Residual Z-Score vs QQQ",
-    yaxis_title="Z-score",
-    labels={"zscore": "BTC residual z-score"},
-    horizontal_lines=[
-        {"y": ENTRY_ZSCORE, "color": "red", "dash": "dash", "label": f"entry threshold ({ENTRY_ZSCORE})"},
-        {"y": 0, "color": "black", "dash": "solid"},
-    ],
-)
-fig.show()
+fig, ax = plt.subplots()
+analysis["zscore"].plot(ax=ax, label="BTC residual z-score")
+ax.axhline(ENTRY_ZSCORE, color="tab:red", linestyle="--", label=f"entry threshold ({ENTRY_ZSCORE})")
+ax.axhline(0, color="black", linewidth=1)
+ax.set_title("BTC Residual Z-Score vs QQQ")
+ax.set_xlabel("Date")
+ax.set_ylabel("Z-score")
+ax.legend()
+plt.show()
 
 # %%
 strategy_equity = (1 + analysis["strategy_return"]).cumprod()
 upro_equity = (1 + analysis["UPRO_return"]).cumprod()
 
-fig = plot_time_series_with_start_slider(
-    pd.DataFrame(
-        {
-            "strategy": strategy_equity,
-            "upro": upro_equity,
-        }
-    ),
-    title="Backtest Equity Curve",
-    yaxis_title="Growth of $1 notional",
-    labels={"strategy": "Residual signal strategy", "upro": "Buy and hold UPRO"},
-)
-fig.show()
+fig, ax = plt.subplots()
+strategy_equity.plot(ax=ax, label="Residual signal strategy")
+upro_equity.plot(ax=ax, label="Buy and hold UPRO")
+ax.set_title("Backtest Equity Curve")
+ax.set_xlabel("Date")
+ax.set_ylabel("Growth of $1 notional")
+ax.legend()
+plt.show()
 
 # %%
-fig = plot_time_series_with_start_slider(
-    (TRADE_NOTIONAL_USD * analysis["strategy_return"].cumsum()).rename("strategy_pnl"),
-    title="Cumulative Strategy P&L on $10k UPRO Notional",
-    yaxis_title="Cumulative P&L ($)",
-    labels={"strategy_pnl": "Strategy P&L"},
-)
-fig.show()
+fig, ax = plt.subplots()
+(TRADE_NOTIONAL_USD * analysis["strategy_return"].cumsum()).plot(ax=ax)
+ax.set_title("Cumulative Strategy P&L on $10k UPRO Notional")
+ax.set_xlabel("Date")
+ax.set_ylabel("Cumulative P&L ($)")
+plt.show()
 
 # %% [markdown]
 # ## Limitations

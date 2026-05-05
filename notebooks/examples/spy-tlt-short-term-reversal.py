@@ -28,11 +28,12 @@
 # %%
 from __future__ import annotations
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from research.data import download_massive_daily_closes
-from research.plotting import apply_default_style, plot_time_series_with_start_slider
+from research.plotting import apply_default_style
 from research.stats import (
     annualized_turnover_one_way,
     mean_daily_turnover_one_way,
@@ -178,39 +179,29 @@ asset_benchmark
 # ## Visualizations
 
 # %%
-fig = plot_time_series_with_start_slider(
-    analysis[["log_ratio", "log_ratio_ma"]],
-    title="Relative-Value Signal",
-    yaxis_title="Log ratio",
-    labels={
-        "log_ratio": "log(SPY/TLT)",
-        "log_ratio_ma": f"{LOOKBACK_DAYS}-day MA",
-    },
-)
-fig.show()
+fig, ax = plt.subplots()
+analysis["log_ratio"].plot(ax=ax, label="log(SPY/TLT)", alpha=0.8)
+analysis["log_ratio_ma"].plot(ax=ax, label=f"{LOOKBACK_DAYS}-day MA", alpha=0.9)
+ax.set_title("Relative-Value Signal")
+ax.set_xlabel("Date")
+ax.set_ylabel("Log ratio")
+ax.legend()
+plt.show()
 
 # %%
 strategy_curve = (1 + analysis["strategy_return"]).cumprod()
 spy_curve = (1 + analysis["SPY_return"].fillna(0)).cumprod().reindex(strategy_curve.index)
 tlt_curve = (1 + analysis["TLT_return"].fillna(0)).cumprod().reindex(strategy_curve.index)
 
-fig = plot_time_series_with_start_slider(
-    pd.DataFrame(
-        {
-            "strategy": strategy_curve,
-            "spy": spy_curve,
-            "tlt": tlt_curve,
-        }
-    ),
-    title="Equity Curves",
-    yaxis_title="Growth of $1",
-    labels={
-        "strategy": "Short-term reversal strategy",
-        "spy": "SPY buy and hold",
-        "tlt": "TLT buy and hold",
-    },
-)
-fig.show()
+fig, ax = plt.subplots()
+strategy_curve.plot(ax=ax, label="Short-term reversal strategy")
+spy_curve.plot(ax=ax, label="SPY buy and hold", alpha=0.75)
+tlt_curve.plot(ax=ax, label="TLT buy and hold", alpha=0.75)
+ax.set_title("Equity Curves")
+ax.set_xlabel("Date")
+ax.set_ylabel("Growth of $1")
+ax.legend()
+plt.show()
 
 # %%
 position_mix = analysis["position_asset"].value_counts(normalize=True).rename("share").to_frame()
