@@ -79,6 +79,13 @@ def run_command(command: Sequence[str], source: Path | None) -> RenderResult:
     start = time.monotonic()
     env = os.environ.copy()
     env.setdefault("QUARTO_PYTHON", sys.executable)
+    repo_root = str(Path.cwd())
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        repo_root
+        if not existing_pythonpath
+        else f"{repo_root}{os.pathsep}{existing_pythonpath}"
+    )
     try:
         completed = subprocess.run(
             command,
