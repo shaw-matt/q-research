@@ -1,4 +1,4 @@
-"""Massive REST API — aggregates for live scripts (notebooks / backtests use S3 flat files)."""
+"""Massive REST API helpers for aggregates and OPRA option contracts."""
 
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ def _api_key() -> str:
         or os.getenv("POLYGON_API_KEY_ID")
         or ""
     )
+
+
+def has_api_key() -> bool:
+    """Return whether a Massive REST API key is available in the environment."""
+    return bool(_api_key())
 
 
 def _require_api_key() -> str:
@@ -71,8 +76,8 @@ def _fetch_aggs_paginated(
             raise ValueError(
                 "Massive REST returned 401 Unauthorized. "
                 "Confirm MASSIVE_API_KEY or POLYGON_API_KEY, and that your subscription "
-                "includes crypto aggregates. If only BTC failed after stocks worked, "
-                "ensure pagination sends apiKey on next_url (this client re-attaches it)."
+                "includes the requested market data. If only paginated requests fail, "
+                "confirm next_url requests include apiKey (this client re-attaches it)."
             )
         response.raise_for_status()
         payload = response.json()
@@ -124,6 +129,138 @@ def download_rest_stock_day_closes(
 
     frame = pd.concat(series_list, axis=1).sort_index()
     return frame
+
+
+def download_rest_option_contracts(
+    underlying_ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    include_expired: bool = True,
+) -> pd.DataFrame:
+    """
+    Option contract reference data from ``GET /v3/reference/options/contracts``.
+
+    The date range filters contract expiration dates, not trading dates. Expired
+    and active contracts are requested separately because Massive exposes them
+    through the ``expired`` query flag.
+    """
+    key = _require_api_key()
+    base = _rest_base()
+    session = requests.Session()
+    underlying = underlying_ticker.upper()
+    expired_flags = [False, True] if include_expired else [False]
+
+    rows: list[dict[str, Any]] = []
+    for expired in expired_flags:
+        url = f"{base}/v3/reference/options/contracts"
+        params: dict[str, Any] = {
+            "underlying_ticker": underlying,
+            "expiration_date.gte": start_date,
+            "expiration_date.lte": end_date,
+            "expired": str(expired).lower(),
+            "sort": "expiration_date",
+            "order": "asc",
+            "limit": 1000,
+            "apiKey": key,
+        }
+        rows.extend(_fetch_aggs_paginated(session, url, params, api_key=key))
+        time.sleep(0.05)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "underlying_ticker",
+                "contract_type",
+                "expiration_date",
+                "strike_price",
+                "shares_per_contract",
+                "exercise_style",
+                "primary_exchange",
+            ]
+        )
+
+    frame = pd.DataFrame(rows)
+    keep = [
+        "ticker",
+        "underlying_ticker",
+        "contract_type",
+        "expiration_date",
+        "strike_price",
+        "shares_per_contract",
+        "exercise_style",
+        "primary_exchange",
+    ]
+    frame = frame[[column for column in keep if column in frame.columns]].copy()
+    frame["underlying_ticker"] = frame["underlying_ticker"].astype(str).str.upper()
+    frame["contract_type"] = frame["contract_type"].astype(str).str.lower()
+    frame["expiration_date"] = pd.to_datetime(frame["expiration_date"], errors="coerce").dt.normalize()
+    frame["strike_price"] = pd.to_numeric(frame["strike_price"], errors="coerce")
+    frame = frame.dropna(subset=["ticker", "expiration_date", "strike_price"])
+    frame = frame.drop_duplicates(subset=["ticker"]).sort_values(
+        ["expiration_date", "strike_price", "contract_type", "ticker"]
+    )
+    return frame.reset_index(drop=True)
+
+
+def download_rest_option_day_aggs(
+    option_tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """
+    Daily OPRA option aggregates from ``GET /v2/aggs/ticker/{ticker}/range/1/day``.
+
+    Returns a long frame indexed by ``date`` with one row per option ticker/date.
+    Empty or inactive contracts are skipped rather than failing the whole batch.
+    """
+    tickers = sorted({ticker for ticker in option_tickers if ticker})
+    if not tickers:
+        return pd.DataFrame(
+            columns=["ticker", "open", "high", "low", "close", "volume", "vwap", "transactions"]
+        )
+
+    key = _require_api_key()
+    base = _rest_base()
+    session = requests.Session()
+    records: list[dict[str, Any]] = []
+
+    for ticker in tickers:
+        enc = quote(ticker, safe="")
+        url = f"{base}/v2/aggs/ticker/{enc}/range/1/day/{start_date}/{end_date}"
+        params: dict[str, Any] = {
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 50000,
+            "apiKey": key,
+        }
+        bars = _fetch_aggs_paginated(session, url, params, api_key=key)
+        for bar in bars:
+            records.append(
+                {
+                    "date": _session_bar_to_ny_session_date(bar),
+                    "ticker": ticker,
+                    "open": float(bar["o"]) if "o" in bar else float("nan"),
+                    "high": float(bar["h"]) if "h" in bar else float("nan"),
+                    "low": float(bar["l"]) if "l" in bar else float("nan"),
+                    "close": float(bar["c"]) if "c" in bar else float("nan"),
+                    "volume": float(bar["v"]) if "v" in bar else float("nan"),
+                    "vwap": float(bar["vw"]) if "vw" in bar else float("nan"),
+                    "transactions": float(bar["n"]) if "n" in bar else float("nan"),
+                }
+            )
+        time.sleep(0.05)
+
+    if not records:
+        return pd.DataFrame(
+            columns=["ticker", "open", "high", "low", "close", "volume", "vwap", "transactions"]
+        )
+
+    frame = pd.DataFrame.from_records(records)
+    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+    frame = frame.sort_values(["date", "ticker"])
+    return frame.set_index("date")
 
 
 def download_rest_crypto_hourly_closes(

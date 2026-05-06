@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,6 +49,11 @@ from research.massive_flatfiles import (
     download_flatfile_btc_hourly_closes as download_btc_hourly,
     download_flatfile_stock_day_closes as download_equity_closes,
 )
+from research.massive_rest import (
+    download_rest_option_contracts,
+    download_rest_option_day_aggs,
+    has_api_key as has_massive_rest_api_key,
+)
 from research.plotting import apply_default_style
 
 load_dotenv(dotenv_path=".env")
@@ -61,22 +67,27 @@ apply_default_style()
 # - BTC spot prices come from Massive crypto minute flat files resampled to hourly
 #   closes, then aligned to the latest completed hourly close at or before each
 #   equity close.
-# - Historical Bitcoin derivatives open-interest and option-surface fields are
-#   not present in the Massive flat-file helpers used by the existing notebooks.
-#   This notebook therefore looks for a daily user-supplied derivatives file and
-#   makes the coverage explicit before testing the thesis.
-# - Derivatives features are lagged by one equity session by default. This avoids
-#   using end-of-day open-interest or option marks that may not have been known at
-#   the U.S. equity close.
+# - BTC option-price features use U.S.-listed OPRA options on Bitcoin-linked ETFs
+#   as a Massive-native proxy for native BTC options. The default proxy universe
+#   is IBIT, then BITO as a fallback.
+# - ETF option features use near-ATM call/put daily closes around a target 30-day
+#   expiration. They are lagged by one equity session by default to avoid using
+#   option marks that may not have been known at the U.S. equity close.
+# - Historical native BTC open interest is not available from the Massive helpers
+#   in this repository, so open-interest fields can still be supplied through an
+#   optional local daily derivatives file.
 # - The tests are predictive diagnostics, not an executable trading model. They
 #   ignore transaction costs, slippage, taxes, financing, and UPRO path-dependent
 #   leverage effects.
 #
 # ## Data Sources
 #
-# - Massive S3 flat files: `us_stocks_sip/day_aggs_v1` for UPRO daily closes.
+# - Massive S3 flat files: `us_stocks_sip/day_aggs_v1` for UPRO and Bitcoin ETF
+#   daily closes.
 # - Massive S3 flat files: global crypto `minute_aggs_v1` for X:BTC-USD, resampled
 #   to hourly and aligned to U.S. equity closes.
+# - Massive REST OPRA endpoints: option contract reference data and daily option
+#   OHLC aggregates for Bitcoin-linked ETF options.
 # - Optional local derivatives file:
 #   `data/btc_derivatives_daily.csv`, `data/btc_derivatives_daily.parquet`, or the
 #   path in `BTC_DERIVATIVES_DAILY_PATH`.
@@ -102,6 +113,20 @@ DERIVATIVES_FEATURE_LAG_SESSIONS = 1
 ROLLING_ZSCORE_DAYS = 63
 MIN_TEST_OBSERVATIONS = 60
 TRADING_DAYS_PER_YEAR = 252
+
+BTC_OPTION_PROXY_UNDERLYINGS = [
+    ticker.strip().upper()
+    for ticker in os.getenv("BTC_OPTION_PROXY_UNDERLYINGS", "IBIT,BITO").split(",")
+    if ticker.strip()
+]
+OPTION_TARGET_DTE_DAYS = 30
+OPTION_MIN_DTE_DAYS = 14
+OPTION_MAX_DTE_DAYS = 60
+OPTION_CONTRACT_EXPIRATION_BUFFER_DAYS = 90
+OPTION_MAX_UNIQUE_CONTRACTS = int(os.getenv("BTC_OPTION_PROXY_MAX_CONTRACTS", "250"))
+REST_OPTION_CACHE_DIR = Path(
+    os.getenv("Q_RESEARCH_REST_OPTION_CACHE_DIR", ".cache/q-research/massive-rest-options")
+)
 
 DERIVATIVES_PATH_CANDIDATES = [
     Path(os.environ["BTC_DERIVATIVES_DAILY_PATH"])
@@ -146,6 +171,12 @@ FEATURE_DEFINITIONS = [
     FeatureDefinition("btc_dvol_change", "BTC implied volatility index change", "options"),
     FeatureDefinition("btc_25delta_risk_reversal_30d", "BTC 25-delta risk reversal", "options"),
     FeatureDefinition("btc_25delta_butterfly_30d", "BTC 25-delta butterfly", "options"),
+    FeatureDefinition("btc_etf_option_call_yield", "BTC ETF ATM call price / ETF", "etf options"),
+    FeatureDefinition("btc_etf_option_put_yield", "BTC ETF ATM put price / ETF", "etf options"),
+    FeatureDefinition("btc_etf_option_straddle_yield", "BTC ETF ATM straddle price / ETF", "etf options"),
+    FeatureDefinition("btc_etf_option_straddle_yield_change", "BTC ETF straddle yield change", "etf options"),
+    FeatureDefinition("btc_etf_option_volume_zscore", "BTC ETF option volume z-score", "etf options"),
+    FeatureDefinition("btc_etf_option_call_put_volume_ratio", "BTC ETF call/put volume ratio", "etf options"),
 ]
 
 FEATURE_LABELS = {definition.column: definition.label for definition in FEATURE_DEFINITIONS}
@@ -216,6 +247,264 @@ def rolling_zscore(series: pd.Series, lookback: int = ROLLING_ZSCORE_DAYS) -> pd
     mean = series.rolling(lookback).mean()
     volatility = series.rolling(lookback).std()
     return (series - mean) / volatility
+
+
+def option_cache_path(kind: str, parts: list[str]) -> Path:
+    """Build a stable cache path for Massive REST option downloads."""
+    digest = sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return REST_OPTION_CACHE_DIR / f"{kind}_{digest}.parquet"
+
+
+def load_or_download_option_contracts(
+    underlying: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Load cached ETF option contracts or download them from Massive REST."""
+    cache_path = option_cache_path("contracts", [underlying, start_date, end_date])
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    contracts = download_rest_option_contracts(underlying, start_date, end_date)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    contracts.to_parquet(cache_path)
+    return contracts
+
+
+def load_or_download_option_day_aggs(
+    option_tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Load cached option daily aggregates or download them from Massive REST."""
+    tickers = sorted({ticker for ticker in option_tickers if ticker})
+    cache_path = option_cache_path("day_aggs", [start_date, end_date, *tickers])
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    option_aggs = download_rest_option_day_aggs(tickers, start_date, end_date)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    option_aggs.to_parquet(cache_path)
+    return option_aggs
+
+
+def build_contract_pairs(contracts: pd.DataFrame) -> pd.DataFrame:
+    """Pair calls and puts with the same expiration and strike."""
+    if contracts.empty:
+        return pd.DataFrame()
+
+    calls = contracts.loc[contracts["contract_type"] == "call"].copy()
+    puts = contracts.loc[contracts["contract_type"] == "put"].copy()
+    merge_keys = ["underlying_ticker", "expiration_date", "strike_price"]
+    pairs = calls.merge(
+        puts,
+        on=merge_keys,
+        suffixes=("_call", "_put"),
+    )
+    return pairs.rename(
+        columns={
+            "ticker_call": "call_ticker",
+            "ticker_put": "put_ticker",
+        }
+    )
+
+
+def select_near_atm_option_pairs(
+    contracts: pd.DataFrame,
+    underlying_prices: pd.Series,
+    *,
+    target_dte: int = OPTION_TARGET_DTE_DAYS,
+    min_dte: int = OPTION_MIN_DTE_DAYS,
+    max_dte: int = OPTION_MAX_DTE_DAYS,
+) -> pd.DataFrame:
+    """Select one near-ATM call/put pair around the target maturity per date."""
+    pairs = build_contract_pairs(contracts)
+    if pairs.empty or underlying_prices.dropna().empty:
+        return pd.DataFrame()
+
+    selections = []
+    for session_date, underlying_close in underlying_prices.dropna().items():
+        dte = (pairs["expiration_date"] - session_date).dt.days
+        candidates = pairs.loc[dte.between(min_dte, max_dte)].copy()
+        if candidates.empty:
+            continue
+
+        candidates["days_to_expiration"] = dte.loc[candidates.index]
+        candidates["dte_distance"] = (candidates["days_to_expiration"] - target_dte).abs()
+        candidates["strike_distance"] = (candidates["strike_price"] - underlying_close).abs()
+        selected = candidates.sort_values(
+            ["dte_distance", "strike_distance", "expiration_date", "strike_price"]
+        ).iloc[0]
+        selections.append(
+            {
+                "date": session_date,
+                "underlying_ticker": selected["underlying_ticker"],
+                "underlying_close": float(underlying_close),
+                "expiration_date": selected["expiration_date"],
+                "days_to_expiration": int(selected["days_to_expiration"]),
+                "strike_price": float(selected["strike_price"]),
+                "call_ticker": selected["call_ticker"],
+                "put_ticker": selected["put_ticker"],
+            }
+        )
+
+    if not selections:
+        return pd.DataFrame()
+    return pd.DataFrame(selections).set_index("date").sort_index()
+
+
+def lookup_option_field(option_aggs: pd.DataFrame, tickers: pd.Series, field: str) -> pd.Series:
+    """Align option aggregate values to a date-indexed selected-ticker series."""
+    if option_aggs.empty:
+        return pd.Series(np.nan, index=tickers.index, name=field)
+
+    long_field = option_aggs.reset_index().set_index(["date", "ticker"])[field].sort_index()
+    lookup_index = pd.MultiIndex.from_arrays([tickers.index, tickers], names=["date", "ticker"])
+    return pd.Series(long_field.reindex(lookup_index).to_numpy(), index=tickers.index, name=field)
+
+
+def build_etf_option_features_from_selection(
+    selections: pd.DataFrame,
+    option_aggs: pd.DataFrame,
+) -> pd.DataFrame:
+    """Convert selected ETF option pair prices into BTC option-price proxy features."""
+    if selections.empty or option_aggs.empty:
+        return pd.DataFrame(index=selections.index)
+
+    frame = selections.copy()
+    frame["call_close"] = lookup_option_field(option_aggs, frame["call_ticker"], "close")
+    frame["put_close"] = lookup_option_field(option_aggs, frame["put_ticker"], "close")
+    frame["call_volume"] = lookup_option_field(option_aggs, frame["call_ticker"], "volume")
+    frame["put_volume"] = lookup_option_field(option_aggs, frame["put_ticker"], "volume")
+
+    total_volume = frame["call_volume"].fillna(0) + frame["put_volume"].fillna(0)
+    features = pd.DataFrame(index=frame.index)
+    features["btc_etf_option_call_yield"] = frame["call_close"] / frame["underlying_close"]
+    features["btc_etf_option_put_yield"] = frame["put_close"] / frame["underlying_close"]
+    features["btc_etf_option_straddle_yield"] = (
+        frame["call_close"] + frame["put_close"]
+    ) / frame["underlying_close"]
+    features["btc_etf_option_straddle_yield_change"] = features[
+        "btc_etf_option_straddle_yield"
+    ].diff()
+    features["btc_etf_option_volume_zscore"] = rolling_zscore(np.log1p(total_volume))
+    features["btc_etf_option_call_put_volume_ratio"] = np.log(
+        (frame["call_volume"].fillna(0) + 1) / (frame["put_volume"].fillna(0) + 1)
+    )
+    features["btc_etf_option_days_to_expiration"] = frame["days_to_expiration"]
+    features["btc_etf_option_moneyness"] = frame["strike_price"] / frame["underlying_close"] - 1
+    features["btc_etf_option_underlying"] = frame["underlying_ticker"]
+    return features.replace([np.inf, -np.inf], np.nan)
+
+
+def build_massive_etf_option_features(
+    prices: pd.DataFrame,
+    underlyings: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build Massive OPRA option-price features from Bitcoin-linked ETF options."""
+    status_rows = []
+    selection_frames = []
+    feature_frames = []
+
+    if not has_massive_rest_api_key():
+        return (
+            pd.DataFrame(index=prices.index),
+            pd.DataFrame(
+                [
+                    {
+                        "underlying": ",".join(underlyings),
+                        "status": "skipped",
+                        "message": (
+                            "Massive REST API key not found; set MASSIVE_API_KEY or "
+                            "POLYGON_API_KEY to download ETF option prices."
+                        ),
+                    }
+                ]
+            ),
+            pd.DataFrame(),
+        )
+
+    contract_end = (
+        pd.Timestamp(END_DATE) + pd.Timedelta(days=OPTION_CONTRACT_EXPIRATION_BUFFER_DAYS)
+    ).date().isoformat()
+
+    for underlying in underlyings:
+        if underlying not in prices:
+            status_rows.append(
+                {
+                    "underlying": underlying,
+                    "status": "skipped",
+                    "message": "underlying ETF close was not downloaded from Massive flat files",
+                }
+            )
+            continue
+
+        contracts = load_or_download_option_contracts(underlying, START_DATE, contract_end)
+        selections = select_near_atm_option_pairs(contracts, prices[underlying])
+        if selections.empty:
+            status_rows.append(
+                {
+                    "underlying": underlying,
+                    "status": "skipped",
+                    "message": f"no near-ATM option pairs found in {OPTION_MIN_DTE_DAYS}-{OPTION_MAX_DTE_DAYS} DTE window",
+                }
+            )
+            continue
+
+        selected_tickers = sorted(
+            set(selections["call_ticker"].dropna()) | set(selections["put_ticker"].dropna())
+        )
+        if len(selected_tickers) > OPTION_MAX_UNIQUE_CONTRACTS:
+            status_rows.append(
+                {
+                    "underlying": underlying,
+                    "status": "skipped",
+                    "message": (
+                        f"selected {len(selected_tickers):,} unique contracts; raise "
+                        "BTC_OPTION_PROXY_MAX_CONTRACTS to download them"
+                    ),
+                }
+            )
+            continue
+
+        option_aggs = load_or_download_option_day_aggs(
+            selected_tickers,
+            selections.index.min().date().isoformat(),
+            selections.index.max().date().isoformat(),
+        )
+        features = build_etf_option_features_from_selection(selections, option_aggs)
+        feature_rows = features.dropna(subset=["btc_etf_option_straddle_yield"])
+        if feature_rows.empty:
+            status_rows.append(
+                {
+                    "underlying": underlying,
+                    "status": "skipped",
+                    "message": "downloaded contracts but found no matched daily option closes",
+                }
+            )
+            continue
+
+        status_rows.append(
+            {
+                "underlying": underlying,
+                "status": "loaded",
+                "message": (
+                    f"{len(feature_rows):,} feature rows from {len(selected_tickers):,} "
+                    "near-ATM call/put contracts"
+                ),
+            }
+        )
+        feature_frames.append(features)
+        selection_frames.append(selections.assign(proxy_underlying=underlying))
+
+    if not feature_frames:
+        return pd.DataFrame(index=prices.index), pd.DataFrame(status_rows), pd.DataFrame()
+
+    combined = pd.DataFrame(index=prices.index)
+    for features in feature_frames:
+        combined = combined.combine_first(features.reindex(prices.index))
+    selections = pd.concat(selection_frames).sort_index() if selection_frames else pd.DataFrame()
+    return combined, pd.DataFrame(status_rows), selections
 
 
 def add_if_present(frame: pd.DataFrame, output: pd.DataFrame, column: str) -> None:
@@ -472,29 +761,34 @@ def summarize_signal_backtest(signal_frame: pd.DataFrame) -> pd.DataFrame:
 # %% [markdown]
 # ## Methodology
 #
-# 1. Download UPRO daily closes and BTC spot closes aligned to each U.S. equity
-#    close.
-# 2. Load a daily BTC derivatives feature file if one is present.
-# 3. Transform raw derivatives fields into stationary predictors: log open
-#    interest, open-interest changes, rolling z-scores, option implied-volatility
-#    changes, risk-reversal/skew fields, and option-activity z-scores.
-# 4. Lag derivatives features by one equity session by default.
-# 5. Measure predictive power against 1-, 5-, 10-, and 21-session forward UPRO
+# 1. Download UPRO and Bitcoin-linked ETF daily closes, then align BTC spot to
+#    each U.S. equity close.
+# 2. Use Massive OPRA REST endpoints to discover near-ATM IBIT/BITO option pairs
+#    and download their daily call/put option prices when a REST key is present.
+# 3. Convert ETF option prices into BTC option-price proxy features such as
+#    call/put premium yield, straddle yield, option-volume z-score, and call/put
+#    volume ratio.
+# 4. Load a local daily BTC derivatives feature file if one is present, primarily
+#    for native BTC open-interest or option-surface fields not covered by OPRA
+#    ETF option aggregates.
+# 5. Lag derivatives features by one equity session by default.
+# 6. Measure predictive power against 1-, 5-, 10-, and 21-session forward UPRO
 #    returns with:
 #    - Spearman and Pearson information coefficients.
 #    - Top-minus-bottom quintile forward-return spreads.
 #    - HAC-robust univariate predictive regressions.
-# 6. Build a simple daily long/flat UPRO signal from the strongest available
+# 7. Build a simple daily long/flat UPRO signal from the strongest available
 #    one-day feature as an implementation sanity check.
 
 # %% [markdown]
 # ## Data
 
 # %%
-equity_closes = download_equity_closes(["UPRO"], START_DATE, END_DATE)
+equity_tickers = sorted({"UPRO", *BTC_OPTION_PROXY_UNDERLYINGS})
+equity_closes = download_equity_closes(equity_tickers, START_DATE, END_DATE)
 btc_hourly_close = download_btc_hourly(START_DATE, END_DATE)
 
-if equity_closes.empty:
+if equity_closes.empty or "UPRO" not in equity_closes:
     raise ValueError("No UPRO equity closes were downloaded.")
 if btc_hourly_close.empty:
     raise ValueError("No BTC-USD hourly closes were downloaded.")
@@ -502,9 +796,38 @@ if btc_hourly_close.empty:
 equity_close_times = build_equity_close_times(equity_closes.index)
 btc_close = align_btc_to_equity_close(btc_hourly_close, equity_close_times)
 
-prices = equity_closes.join(btc_close, how="inner").dropna()
+prices = equity_closes.join(btc_close, how="inner")
+prices = prices.dropna(subset=["UPRO", "btc_close_at_equity_close"])
 prices = prices.rename(columns={"btc_close_at_equity_close": "BTC"})
 prices.tail()
+
+# %%
+etf_option_features_raw, etf_option_status, etf_option_selections = build_massive_etf_option_features(
+    prices,
+    BTC_OPTION_PROXY_UNDERLYINGS,
+)
+etf_option_status
+
+# %%
+if etf_option_features_raw.empty:
+    display(
+        Markdown(
+            "### Massive ETF option proxy status\n\n"
+            "No Bitcoin-linked ETF option-price proxy features were loaded. Check the "
+            "`etf_option_status` table above. A Massive REST key (`MASSIVE_API_KEY` or "
+            "`POLYGON_API_KEY`) is required for OPRA contract discovery and option "
+            "daily aggregates."
+        )
+    )
+else:
+    display(
+        Markdown(
+            "### Massive ETF option proxy status\n\n"
+            f"Loaded **{etf_option_features_raw['btc_etf_option_straddle_yield'].count():,}** "
+            "aligned near-ATM option-price observations."
+        )
+    )
+    display(etf_option_features_raw.dropna(how="all").tail())
 
 # %%
 derivatives_raw, derivatives_load_status = load_derivatives_daily(DERIVATIVES_PATH_CANDIDATES)
@@ -515,10 +838,10 @@ if derivatives_raw.empty:
     display(
         Markdown(
             "### Derivatives data status\n\n"
-            "No local BTC derivatives file was found, so the notebook renders the Massive "
-            "UPRO/BTC spot-control baseline and leaves the open-interest/option-price "
-            "tests inactive. Add `data/btc_derivatives_daily.csv` or set "
-            "`BTC_DERIVATIVES_DAILY_PATH` to activate the thesis-specific tests."
+            "No local BTC derivatives file was found. Native BTC open-interest fields "
+            "will be absent unless `data/btc_derivatives_daily.csv` is added or "
+            "`BTC_DERIVATIVES_DAILY_PATH` is set. Massive ETF option-price proxy "
+            "features are handled separately above."
         )
     )
 else:
@@ -535,6 +858,7 @@ else:
 derivative_features = build_derivative_features(derivatives_raw)
 if not derivative_features.empty:
     derivative_features = derivative_features.shift(DERIVATIVES_FEATURE_LAG_SESSIONS)
+etf_option_features = etf_option_features_raw.shift(DERIVATIVES_FEATURE_LAG_SESSIONS)
 
 spot_features = prices.copy()
 spot_features["UPRO_return"] = spot_features["UPRO"].pct_change()
@@ -545,7 +869,7 @@ spot_features["BTC_realized_vol_21d"] = (
     spot_features["BTC_return"].rolling(21).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 )
 
-analysis = spot_features.join(derivative_features, how="left")
+analysis = spot_features.join([etf_option_features, derivative_features], how="left")
 analysis = add_forward_returns(analysis, FORWARD_RETURN_HORIZONS)
 analysis.tail()
 
@@ -565,9 +889,10 @@ coverage.loc[coverage["observations"] > 0].sort_values(
 # %% [markdown]
 # ## Analysis
 #
-# The first table reports feature coverage. If the derivatives file is absent,
-# only the BTC spot-control rows will be available. Once open-interest or option
-# columns are supplied, the same tests below automatically include them.
+# The first table reports feature coverage. ETF option-price features populate
+# from Massive OPRA when a REST key is present; native BTC open-interest fields
+# populate from the optional local derivatives file. The tests below
+# automatically include whichever feature families have enough observations.
 
 # %%
 coverage
@@ -594,7 +919,9 @@ else:
 
 # %%
 thesis_feature_tests = (
-    predictive_tests.loc[predictive_tests["family"].isin(["open interest", "options"])]
+    predictive_tests.loc[
+        predictive_tests["family"].isin(["open interest", "options", "etf options"])
+    ]
     if not predictive_tests.empty
     else pd.DataFrame()
 )
@@ -603,8 +930,8 @@ if thesis_feature_tests.empty:
     display(
         Markdown(
             "No open-interest or option-price feature has enough observations yet. "
-            "The thesis-specific evidence table will populate after the derivatives "
-            "file is added."
+            "The thesis-specific evidence table will populate after Massive ETF "
+            "option data or the local derivatives file is available."
         )
     )
 else:
@@ -615,7 +942,7 @@ else:
 
 # %%
 if not predictive_tests.empty:
-    family_priority = {"open interest": 0, "options": 1, "spot control": 2}
+    family_priority = {"open interest": 0, "etf options": 1, "options": 2, "spot control": 3}
     best_one_day = (
         predictive_tests.loc[predictive_tests["horizon_days"] == 1]
         .assign(abs_spearman_ic=lambda frame: frame["spearman_ic"].abs())
@@ -648,6 +975,26 @@ ax.set_title("Normalized UPRO and BTC Spot Prices")
 ax.set_xlabel("Date")
 ax.set_ylabel("Growth of $1")
 plt.show()
+
+# %%
+if not etf_option_features.empty:
+    plot_columns = [
+        column
+        for column in [
+            "btc_etf_option_straddle_yield",
+            "btc_etf_option_straddle_yield_change",
+            "btc_etf_option_volume_zscore",
+            "btc_etf_option_call_put_volume_ratio",
+        ]
+        if column in etf_option_features
+    ]
+    if plot_columns:
+        fig, ax = plt.subplots()
+        etf_option_features[plot_columns].dropna(how="all").plot(ax=ax)
+        ax.set_title("Massive BTC ETF Option-Price Proxy Features")
+        ax.set_xlabel("Date")
+        ax.legend()
+        plt.show()
 
 # %%
 if not derivative_features.empty:
@@ -719,12 +1066,16 @@ if not signal_backtest.empty:
 # %% [markdown]
 # ## Limitations
 #
-# - This notebook cannot validate the open-interest or option-price thesis until
-#   a historical BTC derivatives dataset is supplied. Without that file, the
-#   rendered output is a BTC spot-control baseline plus a schema and test harness.
-# - The local derivatives file may combine venues with different reporting times.
-#   The default one-session lag is conservative but may be too conservative for
-#   intraday derivatives marks known before the U.S. equity close.
+# - U.S.-listed Bitcoin ETF options are a proxy for BTC options, not native BTC
+#   options. ETF-specific flows, creation/redemption mechanics, and equity-market
+#   trading hours may affect the signal.
+# - Massive OPRA daily aggregates provide option trade OHLC and volume, but not a
+#   historical implied-volatility surface in this workflow. Straddle yield is a
+#   model-free option-price proxy rather than an IV estimate.
+# - Historical native BTC open interest still requires the optional local
+#   derivatives file. That file may combine venues with different reporting
+#   times; the default one-session lag is conservative but may be too conservative
+#   for intraday marks known before the U.S. equity close.
 # - Open interest can rise because of long or short positioning; direction is not
 #   identifiable without additional long/short or dealer-positioning data.
 # - Option implied volatility and skew can indicate either risk appetite or crash
@@ -738,18 +1089,20 @@ if not signal_backtest.empty:
 #
 # This notebook creates the investigation framework for the thesis that Bitcoin
 # open interest and option prices can predict UPRO forward returns. It aligns
-# UPRO and BTC spot data to the equity close, documents the required derivatives
-# schema, checks feature coverage, and runs rank-correlation, quintile-spread, and
-# HAC regression diagnostics for each available feature and horizon. The thesis
-# should be judged from the open-interest and option rows once the daily
-# derivatives feature file is present.
+# UPRO and BTC spot data to the equity close, builds Massive-native IBIT/BITO
+# near-ATM option-price proxy features when REST credentials are available,
+# accepts optional native BTC derivatives fields, checks feature coverage, and
+# runs rank-correlation, quintile-spread, and HAC regression diagnostics for each
+# available feature and horizon.
 #
 # ## Next Research Ideas
 #
 # - Add venue-level BTC futures and perpetual open interest to separate CME,
 #   Binance, OKX, and Deribit positioning.
-# - Add option-surface features by tenor and delta: ATM IV, 25-delta risk
-#   reversal, butterflies, term structure, and call/put open-interest imbalance.
+# - Expand the ETF option proxy from one near-ATM 30-day straddle to multiple
+#   tenors, deltas, term-structure slopes, and skew approximations.
+# - Add native option-surface features by tenor and delta: ATM IV, 25-delta risk
+#   reversal, butterflies, and call/put open-interest imbalance.
 # - Compare UPRO results with SPY, QQQ, TQQQ, and BTC itself to separate broad
 #   risk-on effects from UPRO-specific leverage.
 # - Use expanding or walk-forward models that choose features on an in-sample
