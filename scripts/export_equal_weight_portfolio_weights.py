@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,65 @@ from research.signal_portfolio_blend import (
 )
 
 load_dotenv(dotenv_path=_REPO_ROOT / ".env")
+
+TRADING_DAYS_PER_YEAR = 252.0
+
+
+def finite_or_none(value: float) -> float | None:
+    """Return JSON-friendly numbers for metrics that may be undefined."""
+    return value if math.isfinite(value) else None
+
+
+def format_percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2%}"
+
+
+def format_decimal(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def summarize_return_stats(
+    return_series: pd.Series,
+    *,
+    trading_days_per_year: float = TRADING_DAYS_PER_YEAR,
+) -> dict[str, float | int | str | None]:
+    """Compute aggregate return statistics for a daily return series."""
+    returns = pd.to_numeric(return_series, errors="coerce").dropna()
+    if returns.empty:
+        return {
+            "observations": 0,
+            "start_date": None,
+            "end_date": None,
+            "total_return": None,
+            "annualized_return": None,
+            "annualized_volatility": None,
+            "sharpe_ratio": None,
+        }
+
+    equity = (1.0 + returns).cumprod()
+    ending_equity = float(equity.iloc[-1])
+    daily_std = float(returns.std())
+    annualized_volatility = daily_std * math.sqrt(trading_days_per_year)
+    sharpe_ratio = (
+        float(returns.mean()) / daily_std * math.sqrt(trading_days_per_year)
+        if daily_std > 0.0
+        else math.nan
+    )
+    annualized_return = (
+        ending_equity ** (trading_days_per_year / len(returns)) - 1.0
+        if ending_equity > 0.0
+        else math.nan
+    )
+
+    return {
+        "observations": int(len(returns)),
+        "start_date": str(returns.index.min().date()),
+        "end_date": str(returns.index.max().date()),
+        "total_return": finite_or_none(ending_equity - 1.0),
+        "annualized_return": finite_or_none(annualized_return),
+        "annualized_volatility": finite_or_none(annualized_volatility),
+        "sharpe_ratio": finite_or_none(sharpe_ratio),
+    }
 
 
 def main() -> None:
@@ -117,6 +177,7 @@ def main() -> None:
     )
     if args.as_of is not None:
         table = table.loc[: pd.Timestamp(args.as_of)]
+    return_stats = summarize_return_stats(table["model_equal_weight_return"])
     if args.latest_only:
         table = table.tail(1)
 
@@ -138,6 +199,7 @@ def main() -> None:
         "blend": "equal_weight_four_signal",
         "data_source": args.data_source,
         "equal_weight_per_signal": float(w.iloc[0]),
+        "return_stats": return_stats,
         "rows": int(len(table)),
         "session_date_min": str(table.index.min().date()) if len(table) else None,
         "session_date_max": str(table.index.max().date()) if len(table) else None,
@@ -150,6 +212,13 @@ def main() -> None:
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"Wrote {args.out} ({len(table)} rows)")
     print(f"Wrote {meta_path}")
+    print(
+        "Return stats: "
+        f"total_return={format_percent(return_stats['total_return'])}, "
+        f"annualized_return={format_percent(return_stats['annualized_return'])}, "
+        f"annualized_volatility={format_percent(return_stats['annualized_volatility'])}, "
+        f"sharpe_ratio={format_decimal(return_stats['sharpe_ratio'])}"
+    )
 
 
 if __name__ == "__main__":
