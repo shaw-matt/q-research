@@ -204,6 +204,7 @@ def apply_vol_target(
 
 _portfolio_params = SignalPortfolioParams(
     start_date=START_DATE,
+    residual_start_date="2023-01-01",
     eom_trigger_day=EOM_TRIGGER_DAY,
     relative_reversal_lookback=RELATIVE_REVERSAL_LOOKBACK,
     turn_of_month_window=TURN_OF_MONTH_WINDOW,

@@ -40,6 +40,19 @@ uv run python scripts/render_notebooks.py
 Set `Q_RESEARCH_NOTEBOOK_RENDER_JOBS` or pass `--jobs` to control the number of
 parallel notebook renders.
 
+The publish workflow first warms the Massive flat-file cache used by the
+notebooks, then renders notebooks in parallel. The warm-up step prevents
+multiple Quarto worker processes from downloading the same multi-year data
+slices. For local cold-cache runs, use:
+
+```bash
+uv run python scripts/warm_flatfile_cache.py
+uv run python scripts/render_notebooks.py
+```
+
+Set `Q_RESEARCH_FLATFILE_DOWNLOAD_WORKERS` to tune the number of concurrent S3
+flat-file day downloads during cache warm-up.
+
 ## Create a New Notebook
 
 Copy `notebooks/template.py` into a new file:

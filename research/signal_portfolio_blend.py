@@ -16,6 +16,7 @@ from research.upro_residual import build_upro_residual_strategy_frame
 @dataclass(frozen=True)
 class SignalPortfolioParams:
     start_date: str = "2004-01-01"
+    residual_start_date: str | None = None
     eom_trigger_day: int = 15
     relative_reversal_lookback: int = 5
     turn_of_month_window: int = 5
@@ -179,6 +180,7 @@ def build_signal_portfolio_bundle(
 ) -> SignalPortfolioBundle:
     p = params or SignalPortfolioParams()
     end = pd.Timestamp.now(tz=UTC).date().isoformat()
+    residual_start = p.residual_start_date or p.start_date
     if data_source == "rest":
         from research.massive_rest import download_rest_stock_day_closes
 
@@ -198,7 +200,7 @@ def build_signal_portfolio_bundle(
     spy_tlt_returns = pd.concat([eom_ret, rel_ret, tom_ret], axis=1)
 
     upro_frame = build_upro_residual_strategy_frame(
-        start_date=p.start_date,
+        start_date=residual_start,
         end_date=end,
         beta_lookback=p.beta_lookback_days,
         zscore_lookback=p.zscore_lookback_days,

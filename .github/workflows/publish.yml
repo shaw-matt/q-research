@@ -67,6 +67,9 @@ jobs:
         if: env.SHOULD_PUBLISH == 'true'
       - uses: astral-sh/setup-uv@v5
         if: env.SHOULD_PUBLISH == 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - uses: actions/setup-python@v5
         if: env.SHOULD_PUBLISH == 'true'
         with:
@@ -75,6 +78,14 @@ jobs:
         if: env.SHOULD_PUBLISH == 'true'
       - run: uv run python -m ipykernel install --user --name python3 --display-name "Python 3"
         if: env.SHOULD_PUBLISH == 'true'
+      - run: uv run python scripts/warm_flatfile_cache.py
+        if: env.SHOULD_PUBLISH == 'true'
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          Q_RESEARCH_FLATFILE_CACHE: "1"
+          Q_RESEARCH_FLATFILE_CACHE_DIR: .cache/q-research/flatfiles
+          MASSIVE_S3_ACCESS_KEY_ID: ${{ secrets.MASSIVE_S3_ACCESS_KEY_ID }}
+          MASSIVE_S3_SECRET_ACCESS_KEY: ${{ secrets.MASSIVE_S3_SECRET_ACCESS_KEY }}
       - run: uv run python scripts/render_notebooks.py
         if: env.SHOULD_PUBLISH == 'true'
         env:

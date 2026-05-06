@@ -73,6 +73,12 @@ def main() -> None:
         help="First calendar date for data (default: 2017-01-01 for --data-source rest, "
         "2004-01-01 for s3 — see script docstring)",
     )
+    parser.add_argument(
+        "--residual-start-date",
+        type=str,
+        default=None,
+        help="Optional first date for the BTC/QQQ residual leg. Defaults to --start-date.",
+    )
     parser.add_argument("--eom-trigger-day", type=int, default=15)
     parser.add_argument("--relative-reversal-lookback", type=int, default=5)
     parser.add_argument("--turn-of-month-window", type=int, default=5)
@@ -93,6 +99,7 @@ def main() -> None:
 
     params = SignalPortfolioParams(
         start_date=effective_start,
+        residual_start_date=args.residual_start_date,
         eom_trigger_day=args.eom_trigger_day,
         relative_reversal_lookback=args.relative_reversal_lookback,
         turn_of_month_window=args.turn_of_month_window,
@@ -127,6 +134,7 @@ def main() -> None:
         "exported_at_utc": datetime.now(tz=UTC).isoformat(),
         "params": {
             "start_date": params.start_date,
+            "residual_start_date": params.residual_start_date,
             "start_date_cli": args.start_date,
             "eom_trigger_day": params.eom_trigger_day,
             "relative_reversal_lookback": params.relative_reversal_lookback,
