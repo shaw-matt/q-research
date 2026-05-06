@@ -30,7 +30,8 @@
 # %%
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -74,6 +75,8 @@ apply_default_style()
 # - Massive S3 flat files: global crypto `minute_aggs_v1` for X:BTC-USD, resampled to hourly.
 
 # %%
+NY_TZ = ZoneInfo("America/New_York")
+
 START_DATE = "2023-01-01"
 END_DATE = datetime.now(UTC).date().isoformat()
 
@@ -619,10 +622,40 @@ def classify_close_action(signal_at_close: bool, current_position: bool) -> str:
     return "STAY FLAT"
 
 
+def next_weekday_session(session_date: date) -> date:
+    """Return the next weekday session after ``session_date``."""
+    candidate = session_date + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def resolve_decision_session(latest_session: pd.Timestamp, run_date: date | str | None = None) -> date:
+    """Choose the session date the latest complete close is informing."""
+    latest_date = pd.Timestamp(latest_session).date()
+    effective_run_date = (
+        datetime.now(NY_TZ).date()
+        if run_date is None
+        else pd.Timestamp(run_date).date()
+    )
+    if effective_run_date <= latest_date:
+        return latest_date
+    if effective_run_date.weekday() < 5:
+        return effective_run_date
+    return next_weekday_session(latest_date)
+
+
+def classify_position_decision(signal_at_close: bool) -> str:
+    """Translate the latest completed signal into the target position for the decision session."""
+    return "BE LONG UPRO" if signal_at_close else "BE FLAT"
+
+
 def build_current_signal_dashboard(
     frame: pd.DataFrame,
     price_frame: pd.DataFrame,
     close_times: pd.Series,
+    *,
+    run_date: date | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build end-of-day decision and signal-state tables from the latest row."""
     latest_date = frame.index.max()
@@ -634,6 +667,21 @@ def build_current_signal_dashboard(
         bool(latest["signal_at_close"]),
         bool(latest["position"]),
     )
+    run_date_ny = (
+        datetime.now(NY_TZ).date()
+        if run_date is None
+        else pd.Timestamp(run_date).date()
+    )
+    decision_session = resolve_decision_session(latest_date, run_date=run_date_ny)
+    position_decision = classify_position_decision(bool(latest["signal_at_close"]))
+    data_status = (
+        "latest complete equity close is included for the decision session"
+        if decision_session == latest_date.date()
+        else (
+            f"using {latest_date:%Y-%m-%d} as the latest complete equity close; "
+            f"{decision_session:%Y-%m-%d} close is not in flat files yet"
+        )
+    )
     target_notional = TRADE_NOTIONAL_USD if bool(latest["signal_at_close"]) else 0
     target_shares = (
         target_notional / latest_prices["UPRO"]
@@ -644,8 +692,12 @@ def build_current_signal_dashboard(
     decision_table = pd.DataFrame(
         {
             "item": [
+                "notebook_run_date_ny",
+                "decision_session",
                 "latest_equity_session",
                 "equity_close_time_utc",
+                "data_status",
+                "position_for_decision_session",
                 "end_of_day_action",
                 "signal_for_next_session",
                 "position_during_latest_session",
@@ -653,8 +705,12 @@ def build_current_signal_dashboard(
                 "approx_upro_shares_at_close",
             ],
             "value": [
+                run_date_ny.strftime("%Y-%m-%d"),
+                decision_session.strftime("%Y-%m-%d"),
                 latest_date.strftime("%Y-%m-%d"),
                 close_times.loc[latest_date].strftime("%Y-%m-%d %H:%M %Z"),
+                data_status,
+                position_decision,
                 action,
                 "ON" if bool(latest["signal_at_close"]) else "OFF",
                 "LONG" if bool(latest["position"]) else "FLAT",
@@ -1073,9 +1129,9 @@ plt.show()
 # ## Current Signal Dashboard
 #
 # Use this final section after the market close to decide whether the strategy
-# calls for a UPRO trade for the next close-to-close holding interval. The action
-# compares today's close signal with the position that was active during the most
-# recent completed session.
+# calls for a UPRO trade for the next close-to-close holding interval. If the
+# current trading day's equity close is not in the flat files yet, the dashboard
+# labels the current session decision separately from the latest completed close.
 
 # %%
 current_decision, current_signal_state = build_current_signal_dashboard(
@@ -1087,18 +1143,32 @@ latest_action = current_decision.loc[
     current_decision["item"] == "end_of_day_action",
     "value",
 ].iloc[0]
+position_decision = current_decision.loc[
+    current_decision["item"] == "position_for_decision_session",
+    "value",
+].iloc[0]
 latest_signal_state = current_decision.loc[
     current_decision["item"] == "signal_for_next_session",
+    "value",
+].iloc[0]
+decision_session = current_decision.loc[
+    current_decision["item"] == "decision_session",
     "value",
 ].iloc[0]
 latest_session = current_decision.loc[
     current_decision["item"] == "latest_equity_session",
     "value",
 ].iloc[0]
+data_status = current_decision.loc[
+    current_decision["item"] == "data_status",
+    "value",
+].iloc[0]
 
 display(
     Markdown(
-        f"### End-of-day decision for {latest_session}: **{latest_action}**\n\n"
+        f"### UPRO decision for {decision_session}: **{position_decision}**\n\n"
+        f"Basis: {data_status}. Latest completed session: **{latest_session}**. "
+        f"Close action from that signal: **{latest_action}**. "
         f"Signal for the next close-to-close interval: **{latest_signal_state}**."
     )
 )
