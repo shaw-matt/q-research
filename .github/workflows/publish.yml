@@ -27,11 +27,28 @@ jobs:
     steps:
       - name: Confirm scheduled run time
         if: github.event_name == 'schedule'
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "$(TZ=America/Chicago date +%H)" != "16" ]; then
-            echo "SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
-            echo "Skipping because it is not 4 PM CT."
+          chicago_offset="$(TZ=America/Chicago date +%z)"
+          expected_schedule="0 21 * * *"
+          if [ "$chicago_offset" = "-0600" ]; then
+            expected_schedule="0 22 * * *"
           fi
+
+          if [ "$EVENT_SCHEDULE" != "$expected_schedule" ]; then
+            echo "SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            echo "Skipping duplicate DST schedule ($EVENT_SCHEDULE); expected $expected_schedule for current Chicago offset."
+            exit 0
+          fi
+
+          if [ "$(TZ=America/Chicago date +%H)" -lt 16 ]; then
+            echo "SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            echo "Skipping because this delayed scheduled run is before 4 PM CT."
+            exit 0
+          fi
+
+          echo "Publishing scheduled notebook refresh for the 4 PM CT slot ($EVENT_SCHEDULE)."
       - uses: actions/checkout@v4
         if: env.SHOULD_PUBLISH == 'true'
       - name: Massive flat-file cache id
