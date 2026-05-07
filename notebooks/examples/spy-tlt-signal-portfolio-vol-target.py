@@ -13,24 +13,31 @@
 # ---
 
 # %% [markdown]
-# # Vol-Targeted Optimized Portfolio of SPY/TLT Signals
+# # Equal-Weight Portfolio of SPY/TLT Signals + BTC/QQQ Residual UPRO Signal
 #
 # ## Research Question
 #
 # If we combine the SPY/TLT calendar and relative-value signals with the
-# BTC/QQQ residual long-UPRO rule into one portfolio, can optimized weights
-# plus a volatility target improve risk-adjusted performance?
+# BTC/QQQ residual long-UPRO rule into one portfolio, does a simple equal-weight
+# blend improve diversification and risk-adjusted performance versus each signal
+# on a standalone basis?
 #
-# **Production default:** equal-weight blending across the four signals (each
-# leg receives `1/4` of capital). In-sample results here often favor that simple
-# mix over optimized weights; daily weights for hand trading are exported with
+# **Portfolio decision for this notebook:** equal-weight blending across the four
+# signals (each leg receives `1/4` of capital), with no optimization overlay.
+# Daily weights for execution are exported with
 # `scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Hypothesis
 #
-# The four signals likely have different timing and risk profiles. A
-# constrained optimized blend should diversify signal noise, and a volatility
-# target should stabilize drawdowns and annualized risk.
+# The four signals likely have different timing and risk profiles, so equal
+# weighting can diversify idiosyncratic signal noise without adding model
+# complexity.
+#
+# **Bitcoin UPRO prediction thesis:** when BTC strength is unusually high
+# relative to a beta-adjusted QQQ move at the U.S. equity close, the residual
+# can capture incremental risk-on information not fully explained by equities.
+# That residual-threshold signal may improve the portfolio by contributing a
+# partially distinct return stream rather than only adding more S&P 500 beta.
 
 # %%
 from __future__ import annotations
@@ -43,7 +50,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from scipy.optimize import minimize
 
 if "__file__" in globals():
     _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +59,7 @@ else:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from research.data import download_massive_daily_closes
 from research.plotting import apply_default_style
 from research.signal_portfolio_blend import (
     SignalPortfolioParams,
@@ -75,8 +82,8 @@ apply_default_style()
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-# - Weight optimization is done in-sample only, then evaluated out-of-sample.
-# - Vol targeting uses rolling realized volatility and next-day scaling.
+# - Portfolio construction is fixed to equal-weight (`25%` per signal) for the
+#   full sample; no weight optimization or vol-target overlay is applied.
 # - Transaction costs, slippage, borrow costs, and financing are excluded.
 #
 # ## Data Sources
@@ -88,16 +95,13 @@ apply_default_style()
 # %%
 START_DATE = "2004-01-01"
 TRADING_DAYS_PER_YEAR = 252
-TRAIN_FRACTION = 0.60
-TARGET_ANNUAL_VOL = 0.10
-VOL_LOOKBACK_DAYS = 20
-MAX_LEVERAGE = 2.5
 EOM_TRIGGER_DAY = 15
 RELATIVE_REVERSAL_LOOKBACK = 5
 TURN_OF_MONTH_WINDOW = 5
 BETA_LOOKBACK_DAYS = 40
 ZSCORE_LOOKBACK_DAYS = 20
 ENTRY_ZSCORE = 1.5
+ROLLING_BETA_WINDOW = 63
 
 
 def max_drawdown(return_series: pd.Series) -> float:
@@ -143,29 +147,41 @@ def summarize_returns(return_series: pd.Series) -> dict[str, float]:
     }
 
 
-def optimize_sharpe_weights(returns_frame: pd.DataFrame) -> pd.Series:
-    clean = returns_frame.dropna()
-    if clean.empty:
-        raise ValueError("Cannot optimize weights with an empty returns frame.")
+def beta_to_benchmark(return_series: pd.Series, benchmark_return: pd.Series) -> tuple[float, float]:
+    aligned = pd.concat(
+        [return_series.rename("signal"), benchmark_return.rename("benchmark")],
+        axis=1,
+    ).dropna()
+    if aligned.empty:
+        return np.nan, np.nan
+    variance = aligned["benchmark"].var()
+    if variance <= 0:
+        return np.nan, np.nan
+    beta = aligned["signal"].cov(aligned["benchmark"]) / variance
+    correlation = aligned["signal"].corr(aligned["benchmark"])
+    return float(beta), float(correlation)
 
-    assets = clean.columns.tolist()
-    n_assets = len(assets)
-    initial = np.repeat(1 / n_assets, n_assets)
 
-    def objective(weights: np.ndarray) -> float:
-        portfolio = clean.to_numpy() @ weights
-        vol = portfolio.std()
-        if vol <= 0:
-            return 1e6
-        sharpe = portfolio.mean() / vol * np.sqrt(TRADING_DAYS_PER_YEAR)
-        return -sharpe
-
-    bounds = [(0.0, 1.0)] * n_assets
-    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0},)
-    result = minimize(objective, x0=initial, bounds=bounds, constraints=constraints, method="SLSQP")
-    if not result.success:
-        raise RuntimeError(f"Weight optimization failed: {result.message}")
-    return pd.Series(result.x, index=assets, name="weight")
+def summarize_beta_vs_spy(
+    returns_frame: pd.DataFrame,
+    benchmark_return: pd.Series,
+) -> pd.DataFrame:
+    rows: list[dict[str, float | int | str]] = []
+    for column in returns_frame.columns:
+        aligned = pd.concat(
+            [returns_frame[column].rename("signal"), benchmark_return.rename("benchmark")],
+            axis=1,
+        ).dropna()
+        beta, corr = beta_to_benchmark(aligned["signal"], aligned["benchmark"])
+        rows.append(
+            {
+                "series": column,
+                "observations": len(aligned),
+                "beta_to_sp500_proxy_spy": beta,
+                "correlation_to_sp500_proxy_spy": corr,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("beta_to_sp500_proxy_spy")
 
 
 def plot_exposure_mix(ax, shares: pd.DataFrame, title: str) -> None:
@@ -183,23 +199,6 @@ def plot_exposure_mix(ax, shares: pd.DataFrame, title: str) -> None:
     ax.tick_params(axis="x", labelsize=9)
     plt.setp(ax.get_xticklabels(), rotation=28, ha="right")
     ax.legend(loc="upper left", fontsize=8)
-
-
-def apply_vol_target(
-    return_series: pd.Series,
-    *,
-    target_annual_vol: float,
-    lookback_days: int,
-    max_leverage: float,
-) -> pd.DataFrame:
-    frame = pd.DataFrame({"base_return": return_series})
-    realized_vol = frame["base_return"].rolling(lookback_days).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-    raw_leverage = target_annual_vol / realized_vol
-    frame["leverage"] = raw_leverage.replace([np.inf, -np.inf], np.nan).clip(upper=max_leverage)
-    frame["leverage"] = frame["leverage"].fillna(1.0).shift(1).fillna(1.0)
-    frame["vol_targeted_return"] = frame["base_return"] * frame["leverage"]
-    frame["realized_annual_vol"] = realized_vol
-    return frame
 
 
 _portfolio_params = SignalPortfolioParams(
@@ -222,12 +221,13 @@ signal_returns.tail(10)
 #
 # 1. Build daily return streams for the three SPY/TLT rules and the UPRO residual rule.
 # 2. Inner-join on dates so all legs are defined (sample starts when UPRO/BTC data allow).
-# 3. Split the sample into train (first 60%) and test (last 40%).
-# 4. Optimize non-negative weights that sum to one to maximize train Sharpe.
-# 5. Apply optimized static weights to create blended portfolio returns.
-# 6. Vol-target the blended portfolio using rolling 20-day realized volatility.
-# 7. Compare equal-weight, optimized, and optimized-plus-vol-targeted variants.
-# 8. Export equal-weight implied ETF weights for production with
+# 3. Apply fixed equal weights (`25%` per signal) to build portfolio returns.
+# 4. Compare standalone signal performance with the equal-weight blend.
+# 5. Measure pairwise signal correlation to check whether each added signal
+#    increases diversification.
+# 6. Estimate each signal's beta to the S&P 500 proxy (SPY daily returns) to
+#    separate directional market exposure from idiosyncratic edge.
+# 7. Export equal-weight implied ETF weights for production with
 #    `scripts/export_equal_weight_portfolio_weights.py` (shared pipeline in
 #    `research.signal_portfolio_blend`).
 
@@ -235,55 +235,33 @@ signal_returns.tail(10)
 # ## Analysis
 
 # %%
-split_idx = int(len(signal_returns) * TRAIN_FRACTION)
-train_returns = signal_returns.iloc[:split_idx]
-test_returns = signal_returns.iloc[split_idx:]
-
-optimized_weights = optimize_sharpe_weights(train_returns)
 equal_weights = equal_blend_weights(signal_returns)
-
-weight_table = pd.concat([equal_weights.rename("equal_weight"), optimized_weights.rename("optimized_weight")], axis=1)
+weight_table = equal_weights.rename("equal_weight").to_frame()
 weight_table
 
 # %%
-portfolio_returns = pd.DataFrame(index=signal_returns.index)
-portfolio_returns["equal_weight_return"] = signal_returns.mul(equal_weights, axis=1).sum(axis=1)
-portfolio_returns["optimized_return"] = signal_returns.mul(optimized_weights, axis=1).sum(axis=1)
-
-vol_target_frame = apply_vol_target(
-    portfolio_returns["optimized_return"],
-    target_annual_vol=TARGET_ANNUAL_VOL,
-    lookback_days=VOL_LOOKBACK_DAYS,
-    max_leverage=MAX_LEVERAGE,
-)
-portfolio_returns["optimized_vol_target_return"] = vol_target_frame["vol_targeted_return"]
-portfolio_returns = portfolio_returns.dropna()
+portfolio_returns = pd.DataFrame(
+    {
+        "equal_weight_return": signal_returns.mul(equal_weights, axis=1).sum(axis=1),
+    }
+).dropna()
 portfolio_returns.tail(10)
 
 # %%
+combined_returns = signal_returns.join(portfolio_returns, how="inner")
+combined_returns.tail(10)
+
+# %%
 summary_rows: list[dict[str, object]] = []
-for strategy_name in [
-    "equal_weight_return",
-    "optimized_return",
-    "optimized_vol_target_return",
-]:
-    full_metrics = summarize_returns(portfolio_returns[strategy_name])
-    train_series = portfolio_returns.loc[train_returns.index, strategy_name].dropna()
-    test_series = portfolio_returns.loc[test_returns.index, strategy_name].dropna()
-    train_metrics = summarize_returns(train_series)
-    test_metrics = summarize_returns(test_series)
-    if strategy_name == "optimized_vol_target_return":
-        full_exposure = vol_target_frame["leverage"].reindex(
-            portfolio_returns[strategy_name].dropna().index
-        ).fillna(1.0)
-        train_exposure = vol_target_frame["leverage"].reindex(train_series.index).fillna(1.0)
-        test_exposure = vol_target_frame["leverage"].reindex(test_series.index).fillna(1.0)
+for strategy_name in combined_returns.columns:
+    full_metrics = summarize_returns(combined_returns[strategy_name])
+    strategy_index = combined_returns[strategy_name].dropna().index
+    if strategy_name == "equal_weight_return":
+        strategy_exposure = blend_signal_exposures(per_signal_exposure, equal_weights).reindex(
+            strategy_index
+        ).fillna(0.0)
     else:
-        full_exposure = pd.Series(
-            1.0, index=portfolio_returns[strategy_name].dropna().index
-        )
-        train_exposure = pd.Series(1.0, index=train_series.index)
-        test_exposure = pd.Series(1.0, index=test_series.index)
+        strategy_exposure = per_signal_exposure[strategy_name].reindex(strategy_index).fillna(0.0)
     summary_rows.append(
         {
             "strategy": strategy_name,
@@ -291,21 +269,9 @@ for strategy_name in [
             "full_sharpe": full_metrics["sharpe_ratio"],
             "full_max_drawdown": full_metrics["max_drawdown"],
             "full_ann_vol": full_metrics["annualized_volatility"],
-            "full_mean_daily_turnover_one_way": mean_daily_turnover_one_way(full_exposure),
+            "mean_daily_turnover_one_way": mean_daily_turnover_one_way(strategy_exposure),
             "full_annualized_turnover_one_way": annualized_turnover_one_way(
-                full_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
-            ),
-            "train_sharpe": train_metrics["sharpe_ratio"],
-            "train_mean_daily_turnover_one_way": mean_daily_turnover_one_way(train_exposure),
-            "train_annualized_turnover_one_way": annualized_turnover_one_way(
-                train_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
-            ),
-            "test_sharpe": test_metrics["sharpe_ratio"],
-            "test_total_return": test_metrics["total_return"],
-            "test_max_drawdown": test_metrics["max_drawdown"],
-            "test_mean_daily_turnover_one_way": mean_daily_turnover_one_way(test_exposure),
-            "test_annualized_turnover_one_way": annualized_turnover_one_way(
-                test_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
+                strategy_exposure, trading_days_per_year=TRADING_DAYS_PER_YEAR
             ),
         }
     )
@@ -314,110 +280,118 @@ performance_summary = pd.DataFrame(summary_rows)
 performance_summary
 
 # %%
-vol_target_diagnostics = pd.DataFrame(
+signal_correlation = signal_returns.corr()
+signal_correlation
+
+# %%
+signal_names = signal_returns.columns.tolist()
+upper_triangle_mask = np.triu(np.ones(signal_correlation.shape, dtype=bool), k=1)
+pairwise_correlations = signal_correlation.where(upper_triangle_mask).stack()
+spy_tlt_corr = signal_returns[[c for c in signal_names if c != "upro_residual"]].corr()
+spy_tlt_pairwise = spy_tlt_corr.where(np.triu(np.ones(spy_tlt_corr.shape, dtype=bool), k=1)).stack()
+diversification_summary = pd.DataFrame(
     {
         "metric": [
-            "target_annual_vol",
-            "average_applied_leverage",
-            "median_applied_leverage",
-            "max_applied_leverage",
-            "realized_ann_vol_of_vol_target_portfolio",
-            "realized_ann_vol_of_unscaled_optimized_portfolio",
+            "avg_pairwise_corr_spy_tlt_only",
+            "avg_pairwise_corr_with_upro_residual",
+            "median_pairwise_corr_with_upro_residual",
+            "min_pairwise_corr_with_upro_residual",
+            "max_pairwise_corr_with_upro_residual",
+            "change_in_avg_pairwise_corr_after_adding_upro_residual",
         ],
         "value": [
-            TARGET_ANNUAL_VOL,
-            vol_target_frame["leverage"].mean(),
-            vol_target_frame["leverage"].median(),
-            vol_target_frame["leverage"].max(),
-            summarize_returns(portfolio_returns["optimized_vol_target_return"])["annualized_volatility"],
-            summarize_returns(portfolio_returns["optimized_return"])["annualized_volatility"],
+            spy_tlt_pairwise.mean(),
+            pairwise_correlations.mean(),
+            pairwise_correlations.median(),
+            pairwise_correlations.min(),
+            pairwise_correlations.max(),
+            pairwise_correlations.mean() - spy_tlt_pairwise.mean(),
         ],
     }
 )
-vol_target_diagnostics
+diversification_summary
+
+# %%
+benchmark_prices = download_massive_daily_closes(["SPY"], start_date=START_DATE).dropna()
+if benchmark_prices.empty:
+    raise ValueError("No SPY benchmark prices were downloaded for beta analysis.")
+benchmark_returns = benchmark_prices["SPY"].pct_change().rename("spy_return")
+beta_input_returns = combined_returns.join(benchmark_returns, how="inner").dropna()
+beta_summary = summarize_beta_vs_spy(
+    beta_input_returns.drop(columns=["spy_return"]),
+    beta_input_returns["spy_return"],
+)
+beta_summary
 
 # %% [markdown]
 # ## Visualizations
 
 # %%
-equity_curves = (1 + portfolio_returns).cumprod()
+equity_curves = (1 + combined_returns).cumprod()
 fig, ax = plt.subplots()
 equity_curves.plot(ax=ax)
-ax.set_title("Signal Portfolio Equity Curves")
+ax.set_title("Signal and Equal-Weight Portfolio Equity Curves")
 ax.set_xlabel("Date")
 ax.set_ylabel("Growth of $1")
-ax.legend(
-    [
-        "Equal-weight signals",
-        "Optimized signals",
-        "Optimized + vol target",
-    ]
-)
 plt.show()
 
 # %%
-# Underlying ETF mix (per $1 of blended signal capital, before the vol overlay).
+# Underlying ETF mix (per $1 of blended signal capital).
 # Slices sum to 100% of gross exposure (SPY long, TLT long, TLT short, UPRO long,
-# cash/flat). Vol targeting applies leverage to optimized returns and does not
-# change these percentages versus the optimized panel below.
+# cash/flat).
 net_equal = blend_signal_exposures(per_signal_exposure, equal_weights)
-net_optimized = blend_signal_exposures(per_signal_exposure, optimized_weights)
-net_equal_plot = net_equal.reindex(portfolio_returns.index).fillna(0.0)
-net_optimized_plot = net_optimized.reindex(portfolio_returns.index).fillna(0.0)
+net_equal_plot = net_equal.reindex(combined_returns.index).fillna(0.0)
 shares_equal = gross_exposure_shares(net_equal_plot)
-shares_optimized = gross_exposure_shares(net_optimized_plot)
 
-fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-plot_exposure_mix(axes[0], shares_equal, "Equal-weight signals — implied ETF mix (% of gross exposure)")
-plot_exposure_mix(
-    axes[1],
-    shares_optimized,
-    "Optimized signals — implied ETF mix (vol-target variant uses this same mix)",
-)
-axes[0].tick_params(axis="x", labelbottom=False)
-axes[0].set_xlabel("")
-fig.subplots_adjust(hspace=0.22, bottom=0.14, left=0.07, right=0.98)
+fig, ax = plt.subplots(figsize=(14, 4))
+plot_exposure_mix(ax, shares_equal, "Equal-weight signals — implied ETF mix (% of gross exposure)")
+fig.subplots_adjust(bottom=0.20, left=0.07, right=0.98)
 plt.show()
 
 # %%
 fig, ax = plt.subplots()
-vol_target_frame["leverage"].reindex(portfolio_returns.index).plot(ax=ax, color="tab:purple")
-ax.axhline(1.0, color="black", linewidth=1, linestyle="--")
-ax.axhline(MAX_LEVERAGE, color="tab:red", linewidth=1, linestyle=":")
-ax.set_title("Applied Vol-Target Leverage")
-ax.set_xlabel("Date")
-ax.set_ylabel("Leverage multiple")
+im = ax.imshow(signal_correlation.values, cmap="coolwarm", vmin=-1, vmax=1)
+ax.set_xticks(np.arange(len(signal_names)), labels=signal_names, rotation=25, ha="right")
+ax.set_yticks(np.arange(len(signal_names)), labels=signal_names)
+ax.set_title("Signal Return Correlation Matrix")
+for i in range(len(signal_names)):
+    for j in range(len(signal_names)):
+        ax.text(
+            j,
+            i,
+            f"{signal_correlation.iloc[i, j]:.2f}",
+            ha="center",
+            va="center",
+            color="black",
+            fontsize=8,
+        )
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
+plt.tight_layout()
 plt.show()
 
 # %%
-rolling_window = 63
-rolling_sharpes = pd.DataFrame(index=portfolio_returns.index)
-for column in portfolio_returns.columns:
-    rolling_mean = portfolio_returns[column].rolling(rolling_window).mean()
-    rolling_std = portfolio_returns[column].rolling(rolling_window).std()
-    rolling_sharpes[column] = rolling_mean / rolling_std * np.sqrt(TRADING_DAYS_PER_YEAR)
+rolling_betas = pd.DataFrame(index=beta_input_returns.index)
+for column in combined_returns.columns:
+    aligned = beta_input_returns[[column, "spy_return"]].dropna()
+    rolling_cov = aligned[column].rolling(ROLLING_BETA_WINDOW).cov(aligned["spy_return"])
+    rolling_var = aligned["spy_return"].rolling(ROLLING_BETA_WINDOW).var()
+    rolling_betas[column] = rolling_cov / rolling_var
 
 fig, ax = plt.subplots()
-rolling_sharpes.plot(ax=ax)
-ax.axhline(0, color="black", linewidth=1)
-ax.set_title(f"Rolling {rolling_window}-Day Sharpe")
+rolling_betas.plot(ax=ax)
+ax.axhline(0.0, color="black", linewidth=1)
+ax.set_title(f"Rolling {ROLLING_BETA_WINDOW}-Day Beta to SP500 Proxy (SPY)")
 ax.set_xlabel("Date")
-ax.set_ylabel("Sharpe")
-ax.legend(
-    [
-        "Equal-weight signals",
-        "Optimized signals",
-        "Optimized + vol target",
-    ]
-)
+ax.set_ylabel("Beta")
 plt.show()
 
 # %% [markdown]
 # ## Limitations
 #
-# - Weight optimization can still overfit the in-sample window.
-# - This notebook uses static optimized weights, not dynamic re-optimization.
-# - Vol-target scaling uses historical realized volatility and may lag shocks.
+# - SPY is used as a liquid S&P 500 proxy; beta estimates versus index futures or
+#   cash index levels may differ slightly.
+# - Correlation and beta are estimated from historical daily close-to-close data
+#   and can shift materially across market regimes.
 # - Costs, turnover drag, and implementation constraints are not modeled.
 # - The inner join with the UPRO residual leg shortens the combined sample to
 #   dates where QQQ, UPRO, BTC, SPY, and TLT history all overlap.
@@ -425,15 +399,15 @@ plt.show()
 # ## Conclusion
 #
 # This notebook backtests a combined portfolio of the three SPY/TLT signals
-# plus the BTC/QQQ residual UPRO rule, compares equal-weight versus optimized
-# blending, and evaluates a volatility targeting overlay on the optimized mix.
-# For execution, prefer the **equal-weight** blend unless out-of-sample metrics
-# justify optimization; export daily weights with
+# plus the BTC/QQQ residual UPRO rule using an explicit **equal-weight**
+# construction. The added diagnostics quantify whether the UPRO residual signal
+# diversifies the signal set (correlation analysis) and how much market exposure
+# each signal contributes (beta to SPY as S&P 500 proxy). Export daily weights with
 # `uv run python scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Next Research Ideas
 #
-# - Add walk-forward re-optimization of signal weights.
-# - Include turnover and trading-cost penalties in the objective.
-# - Compare max-Sharpe optimization with risk parity and minimum-variance blends.
+# - Add conditional-correlation and conditional-beta analysis by volatility
+#   regime to see when diversification is strongest.
+# - Include turnover and trading-cost penalties in performance comparisons.
 # - Add regime filters (rate volatility, trend, correlation state).
