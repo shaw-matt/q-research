@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import sys
+from hashlib import sha256
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -62,6 +63,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from research.data import download_massive_daily_closes
+from research.massive_rest import (
+    download_rest_option_contracts,
+    download_rest_option_day_aggs,
+    has_api_key as has_massive_rest_api_key,
+)
 from research.plotting import apply_default_style
 from research.signal_portfolio_blend import (
     SignalPortfolioParams,
@@ -84,8 +90,8 @@ apply_default_style()
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-# - Optional BTC-derivatives long/flat UPRO overlays are added from local
-#   derivatives features when available.
+# - BTC-derivatives long/flat UPRO overlays are built from Massive OPRA ETF
+#   option features and optional supplemental local derivatives fields.
 # - Portfolio construction is fixed to equal-weight (`1/N` per signal) for the
 #   full sample; no weight optimization or vol-target overlay is applied.
 # - Transaction costs, slippage, borrow costs, and financing are excluded.
@@ -95,6 +101,8 @@ apply_default_style()
 # - Massive S3 flat files (US stock day aggregates) via `research.data`.
 # - Massive S3 flat files for QQQ/UPRO daily and crypto minute BTC for the UPRO
 #   residual signal via `research.upro_residual`.
+# - Massive REST OPRA option contracts/day-aggregates for IBIT/BITO proxy
+#   derivatives features (cached on disk).
 
 # %%
 START_DATE = "2004-01-01"
@@ -116,6 +124,19 @@ DERIVATIVES_PATH_CANDIDATES = [
     _REPO_ROOT / "data/btc_derivatives_daily.parquet",
     _REPO_ROOT / "data/btc_derivatives_daily.csv",
 ]
+BTC_OPTION_PROXY_UNDERLYINGS = [
+    ticker.strip().upper()
+    for ticker in os.getenv("BTC_OPTION_PROXY_UNDERLYINGS", "IBIT,BITO").split(",")
+    if ticker.strip()
+]
+OPTION_TARGET_DTE_DAYS = 30
+OPTION_MIN_DTE_DAYS = 14
+OPTION_MAX_DTE_DAYS = 60
+OPTION_CONTRACT_EXPIRATION_BUFFER_DAYS = 90
+OPTION_MAX_UNIQUE_CONTRACTS = int(os.getenv("BTC_OPTION_PROXY_MAX_CONTRACTS", "250"))
+REST_OPTION_CACHE_DIR = Path(
+    os.getenv("Q_RESEARCH_REST_OPTION_CACHE_DIR", ".cache/q-research/massive-rest-options")
+)
 DERIVATIVE_SIGNAL_COLUMNS = [
     "btc_open_interest_5d_change",
     "btc_option_volume_zscore",
@@ -173,6 +194,142 @@ def rolling_zscore(series: pd.Series, lookback: int = 63) -> pd.Series:
     mean = series.rolling(lookback).mean()
     volatility = series.rolling(lookback).std()
     return (series - mean) / volatility
+
+
+def option_cache_path(kind: str, parts: list[str]) -> Path:
+    digest = sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return REST_OPTION_CACHE_DIR / f"{kind}_{digest}.parquet"
+
+
+def load_or_download_option_contracts(underlying: str, start_date: str, end_date: str) -> pd.DataFrame:
+    cache_path = option_cache_path("contracts", [underlying, start_date, end_date])
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+    contracts = download_rest_option_contracts(underlying, start_date, end_date)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    contracts.to_parquet(cache_path)
+    return contracts
+
+
+def load_or_download_option_day_aggs(
+    option_tickers: list[str], start_date: str, end_date: str
+) -> pd.DataFrame:
+    tickers = sorted({ticker for ticker in option_tickers if ticker})
+    cache_path = option_cache_path("day_aggs", [start_date, end_date, *tickers])
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+    option_aggs = download_rest_option_day_aggs(tickers, start_date, end_date)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    option_aggs.to_parquet(cache_path)
+    return option_aggs
+
+
+def build_contract_pairs(contracts: pd.DataFrame) -> pd.DataFrame:
+    if contracts.empty:
+        return pd.DataFrame()
+    calls = contracts.loc[contracts["contract_type"] == "call"].copy()
+    puts = contracts.loc[contracts["contract_type"] == "put"].copy()
+    merge_keys = ["underlying_ticker", "expiration_date", "strike_price"]
+    pairs = calls.merge(puts, on=merge_keys, suffixes=("_call", "_put"))
+    return pairs.rename(columns={"ticker_call": "call_ticker", "ticker_put": "put_ticker"})
+
+
+def select_near_atm_option_pairs(contracts: pd.DataFrame, underlying_prices: pd.Series) -> pd.DataFrame:
+    pairs = build_contract_pairs(contracts)
+    if pairs.empty or underlying_prices.dropna().empty:
+        return pd.DataFrame()
+    selections = []
+    for session_date, underlying_close in underlying_prices.dropna().items():
+        dte = (pairs["expiration_date"] - session_date).dt.days
+        candidates = pairs.loc[dte.between(OPTION_MIN_DTE_DAYS, OPTION_MAX_DTE_DAYS)].copy()
+        if candidates.empty:
+            continue
+        candidates["days_to_expiration"] = dte.loc[candidates.index]
+        candidates["dte_distance"] = (candidates["days_to_expiration"] - OPTION_TARGET_DTE_DAYS).abs()
+        candidates["strike_distance"] = (candidates["strike_price"] - underlying_close).abs()
+        selected = candidates.sort_values(
+            ["dte_distance", "strike_distance", "expiration_date", "strike_price"]
+        ).iloc[0]
+        selections.append(
+            {
+                "date": session_date,
+                "underlying_ticker": selected["underlying_ticker"],
+                "underlying_close": float(underlying_close),
+                "expiration_date": selected["expiration_date"],
+                "days_to_expiration": int(selected["days_to_expiration"]),
+                "strike_price": float(selected["strike_price"]),
+                "call_ticker": selected["call_ticker"],
+                "put_ticker": selected["put_ticker"],
+            }
+        )
+    if not selections:
+        return pd.DataFrame()
+    return pd.DataFrame(selections).set_index("date").sort_index()
+
+
+def lookup_option_field(option_aggs: pd.DataFrame, tickers: pd.Series, field: str) -> pd.Series:
+    if option_aggs.empty:
+        return pd.Series(np.nan, index=tickers.index, name=field)
+    long_field = option_aggs.reset_index().set_index(["date", "ticker"])[field].sort_index()
+    lookup_index = pd.MultiIndex.from_arrays([tickers.index, tickers], names=["date", "ticker"])
+    return pd.Series(long_field.reindex(lookup_index).to_numpy(), index=tickers.index, name=field)
+
+
+def build_etf_option_features_from_selection(
+    selections: pd.DataFrame, option_aggs: pd.DataFrame
+) -> pd.DataFrame:
+    if selections.empty or option_aggs.empty:
+        return pd.DataFrame(index=selections.index)
+    frame = selections.copy()
+    frame["call_close"] = lookup_option_field(option_aggs, frame["call_ticker"], "close")
+    frame["put_close"] = lookup_option_field(option_aggs, frame["put_ticker"], "close")
+    frame["call_volume"] = lookup_option_field(option_aggs, frame["call_ticker"], "volume")
+    frame["put_volume"] = lookup_option_field(option_aggs, frame["put_ticker"], "volume")
+    total_volume = frame["call_volume"].fillna(0) + frame["put_volume"].fillna(0)
+    features = pd.DataFrame(index=frame.index)
+    features["btc_option_volume_zscore"] = rolling_zscore(np.log1p(total_volume))
+    features["btc_call_put_volume_ratio"] = np.log(
+        (frame["call_volume"].fillna(0) + 1) / (frame["put_volume"].fillna(0) + 1)
+    )
+    features["btc_atm_iv_30d_change"] = (
+        ((frame["call_close"] + frame["put_close"]) / frame["underlying_close"]).diff()
+    )
+    return features.replace([np.inf, -np.inf], np.nan)
+
+
+def build_massive_etf_option_features(prices: pd.DataFrame) -> pd.DataFrame:
+    if not has_massive_rest_api_key():
+        return pd.DataFrame(index=prices.index)
+    contract_end = (
+        pd.Timestamp.today().normalize() + pd.Timedelta(days=OPTION_CONTRACT_EXPIRATION_BUFFER_DAYS)
+    ).date().isoformat()
+    feature_frames: list[pd.DataFrame] = []
+    for underlying in BTC_OPTION_PROXY_UNDERLYINGS:
+        if underlying not in prices:
+            continue
+        contracts = load_or_download_option_contracts(underlying, START_DATE, contract_end)
+        selections = select_near_atm_option_pairs(contracts, prices[underlying])
+        if selections.empty:
+            continue
+        selected_tickers = sorted(
+            set(selections["call_ticker"].dropna()) | set(selections["put_ticker"].dropna())
+        )
+        if len(selected_tickers) > OPTION_MAX_UNIQUE_CONTRACTS:
+            continue
+        option_aggs = load_or_download_option_day_aggs(
+            selected_tickers,
+            selections.index.min().date().isoformat(),
+            selections.index.max().date().isoformat(),
+        )
+        features = build_etf_option_features_from_selection(selections, option_aggs)
+        if not features.empty:
+            feature_frames.append(features.reindex(prices.index))
+    if not feature_frames:
+        return pd.DataFrame(index=prices.index)
+    combined = pd.DataFrame(index=prices.index)
+    for features in feature_frames:
+        combined = combined.combine_first(features)
+    return combined
 
 
 def build_derivative_features(raw: pd.DataFrame) -> pd.DataFrame:
@@ -339,14 +496,19 @@ signal_returns = _bundle.signal_returns
 core_signal_names = signal_returns.columns.tolist()
 per_signal_exposure = _bundle.per_signal_exposure
 
-upro_prices = download_massive_daily_closes(["UPRO"], start_date=START_DATE).dropna()
+upro_prices = download_massive_daily_closes(
+    sorted({"UPRO", *BTC_OPTION_PROXY_UNDERLYINGS}),
+    start_date=START_DATE,
+).dropna(how="all")
 if upro_prices.empty:
     raise ValueError("No UPRO prices were downloaded.")
 upro_return = upro_prices["UPRO"].pct_change()
 upro_forward_returns = add_forward_returns(upro_prices["UPRO"], FORWARD_RETURN_HORIZONS)
 
 derivatives_raw = load_derivatives_daily(DERIVATIVES_PATH_CANDIDATES)
-derivative_features = build_derivative_features(derivatives_raw)
+derivative_features = build_derivative_features(derivatives_raw).reindex(upro_prices.index)
+etf_option_features = build_massive_etf_option_features(upro_prices)
+derivative_features = derivative_features.combine_first(etf_option_features)
 if not derivative_features.empty:
     derivative_features = derivative_features.shift(DERIVATIVES_FEATURE_LAG_SESSIONS)
 btc_derivative_returns, btc_derivative_exposure = build_btc_derivative_signal_legs(
@@ -377,8 +539,8 @@ upro_forward_returns.reindex(signal_returns.index).tail(10)
 # ## Methodology
 #
 # 1. Build daily return streams for the three SPY/TLT rules and the UPRO residual rule.
-# 2. Add BTC-derivatives-based long/flat UPRO legs from lagged derivatives features when
-#    a local derivatives file is available.
+# 2. Build BTC derivatives features from Massive OPRA ETF option data (plus any
+#    supplemental local derivatives fields), then lag features by one session.
 # 3. Compute UPRO forward returns (1/5/10/21-day) for cross-horizon diagnostics.
 # 4. Inner-join on dates so all legs are defined.
 # 5. Apply fixed equal weights across all active signals to build portfolio returns.
@@ -553,8 +715,8 @@ plt.show()
 # - Correlation and beta are estimated from historical daily close-to-close data
 #   and can shift materially across market regimes.
 # - Costs, turnover drag, and implementation constraints are not modeled.
-# - Any optional BTC-derivatives signal legs use a local derivatives dataset; if
-#   that file is missing, this notebook falls back to the core four signals.
+# - OPRA feature coverage depends on ETF option liquidity, selected DTE/strike
+#   filters, and Massive REST API access.
 # - The inner join across active signal legs can shorten the combined sample.
 #
 # ## Conclusion
