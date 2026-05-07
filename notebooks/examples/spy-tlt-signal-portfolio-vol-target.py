@@ -22,14 +22,15 @@
 # blend improve diversification and risk-adjusted performance versus each signal
 # on a standalone basis?
 #
-# **Portfolio decision for this notebook:** equal-weight blending across the four
-# signals (each leg receives `1/4` of capital), with no optimization overlay.
+# **Portfolio decision for this notebook:** equal-weight blending across all
+# active signal legs (each leg receives `1/N` of capital), with no optimization
+# overlay.
 # Daily weights for execution are exported with
 # `scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Hypothesis
 #
-# The four signals likely have different timing and risk profiles, so equal
+# These signals likely have different timing and risk profiles, so equal
 # weighting can diversify idiosyncratic signal noise without adding model
 # complexity.
 #
@@ -42,6 +43,7 @@
 # %%
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -77,12 +79,14 @@ apply_default_style()
 # ## Assumptions
 #
 # - All signals use daily close data and trade on the next close-to-close return.
-# - The four strategies are:
+# - Baseline strategies:
 #   1. End-of-month SPY/TLT laggard rotation from trading day 15.
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-# - Portfolio construction is fixed to equal-weight (`25%` per signal) for the
+# - Optional BTC-derivatives long/flat UPRO overlays are added from local
+#   derivatives features when available.
+# - Portfolio construction is fixed to equal-weight (`1/N` per signal) for the
 #   full sample; no weight optimization or vol-target overlay is applied.
 # - Transaction costs, slippage, borrow costs, and financing are excluded.
 #
@@ -102,12 +106,131 @@ BETA_LOOKBACK_DAYS = 40
 ZSCORE_LOOKBACK_DAYS = 20
 ENTRY_ZSCORE = 1.5
 ROLLING_BETA_WINDOW = 63
+FORWARD_RETURN_HORIZONS = [1, 5, 10, 21]
+DERIVATIVES_FEATURE_LAG_SESSIONS = 1
+DERIVATIVES_PATH_CANDIDATES = [
+    Path(os.environ["BTC_DERIVATIVES_DAILY_PATH"])
+    for _ in [0]
+    if os.getenv("BTC_DERIVATIVES_DAILY_PATH")
+] + [
+    _REPO_ROOT / "data/btc_derivatives_daily.parquet",
+    _REPO_ROOT / "data/btc_derivatives_daily.csv",
+]
+DERIVATIVE_SIGNAL_COLUMNS = [
+    "btc_open_interest_5d_change",
+    "btc_option_volume_zscore",
+    "btc_call_put_volume_ratio",
+    "btc_atm_iv_30d_change",
+    "btc_dvol_change",
+    "btc_25delta_risk_reversal_30d",
+]
 
 
 def max_drawdown(return_series: pd.Series) -> float:
     equity_curve = (1 + return_series.fillna(0)).cumprod()
     drawdown = equity_curve / equity_curve.cummax() - 1
     return float(drawdown.min())
+
+
+def canonicalize_column_name(column: object) -> str:
+    cleaned = str(column).strip().lower()
+    cleaned = cleaned.replace("%", "pct").replace("/", "_").replace("-", "_")
+    cleaned = cleaned.replace(" ", "_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_")
+
+
+def read_derivatives_file(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        raw = pd.read_parquet(path)
+    elif path.suffix.lower() == ".csv":
+        raw = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported derivatives file extension: {path.suffix}")
+    raw = raw.rename(columns={column: canonicalize_column_name(column) for column in raw.columns})
+    if "date" in raw.columns:
+        index = pd.to_datetime(raw.pop("date"), errors="coerce")
+    else:
+        index = pd.to_datetime(raw.index, errors="coerce")
+    raw = raw.loc[index.notna()].copy()
+    raw.index = pd.DatetimeIndex(index[index.notna()]).normalize()
+    raw = raw.sort_index()
+    raw = raw[~raw.index.duplicated(keep="last")]
+    for column in raw.columns:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+    return raw.select_dtypes(include=[np.number]).copy()
+
+
+def load_derivatives_daily(paths: list[Path]) -> pd.DataFrame:
+    for path in paths:
+        if path.exists():
+            return read_derivatives_file(path)
+    return pd.DataFrame()
+
+
+def rolling_zscore(series: pd.Series, lookback: int = 63) -> pd.Series:
+    mean = series.rolling(lookback).mean()
+    volatility = series.rolling(lookback).std()
+    return (series - mean) / volatility
+
+
+def build_derivative_features(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame(index=raw.index)
+    frame = raw.copy()
+    features = pd.DataFrame(index=frame.index)
+    if "btc_open_interest_usd" in frame:
+        oi = frame["btc_open_interest_usd"].replace(0, np.nan).astype(float)
+        oi_log = np.log(oi)
+        features["btc_open_interest_5d_change"] = oi_log.diff(5)
+    if "btc_option_volume_usd" in frame:
+        features["btc_option_volume_zscore"] = rolling_zscore(
+            np.log(frame["btc_option_volume_usd"].replace(0, np.nan).astype(float))
+        )
+    if {"btc_call_volume_usd", "btc_put_volume_usd"}.issubset(frame.columns):
+        call_volume = frame["btc_call_volume_usd"].replace(0, np.nan).astype(float)
+        put_volume = frame["btc_put_volume_usd"].replace(0, np.nan).astype(float)
+        features["btc_call_put_volume_ratio"] = np.log(call_volume / put_volume)
+    if "btc_atm_iv_30d" in frame:
+        features["btc_atm_iv_30d_change"] = frame["btc_atm_iv_30d"].astype(float).diff()
+    if "btc_dvol" in frame:
+        features["btc_dvol_change"] = frame["btc_dvol"].astype(float).diff()
+    if "btc_25delta_risk_reversal_30d" in frame:
+        features["btc_25delta_risk_reversal_30d"] = frame["btc_25delta_risk_reversal_30d"].astype(float)
+    return features.replace([np.inf, -np.inf], np.nan)
+
+
+def add_forward_returns(upro_close: pd.Series, horizons: list[int]) -> pd.DataFrame:
+    out = pd.DataFrame(index=upro_close.index)
+    for horizon in horizons:
+        out[f"UPRO_fwd_{horizon}d_return"] = upro_close.shift(-horizon) / upro_close - 1
+    return out
+
+
+def build_btc_derivative_signal_legs(
+    features: pd.DataFrame,
+    upro_return: pd.Series,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if features.empty:
+        return pd.DataFrame(index=upro_return.index), pd.DataFrame()
+    returns: dict[str, pd.Series] = {}
+    exposures: dict[str, pd.Series] = {}
+    aligned = features.reindex(upro_return.index)
+    for column in DERIVATIVE_SIGNAL_COLUMNS:
+        if column not in aligned or aligned[column].notna().sum() < 120:
+            continue
+        high = aligned[column].rolling(252, min_periods=63).quantile(0.8)
+        signal_at_close = aligned[column] >= high
+        position = signal_at_close.shift(1).fillna(False).astype(float)
+        leg_name = f"btc_deriv_{column}"
+        returns[leg_name] = (position * upro_return).rename(leg_name)
+        exposures[leg_name] = position.rename(leg_name)
+    if not returns:
+        return pd.DataFrame(index=upro_return.index), pd.DataFrame()
+    return_frame = pd.DataFrame(returns, index=upro_return.index)
+    exposure_frame = pd.DataFrame(exposures, index=upro_return.index)
+    return return_frame, exposure_frame
 
 
 def summarize_returns(return_series: pd.Series) -> dict[str, float]:
@@ -213,21 +336,58 @@ _portfolio_params = SignalPortfolioParams(
 )
 _bundle = build_signal_portfolio_bundle(_portfolio_params, data_source="s3")
 signal_returns = _bundle.signal_returns
+core_signal_names = signal_returns.columns.tolist()
 per_signal_exposure = _bundle.per_signal_exposure
+
+upro_prices = download_massive_daily_closes(["UPRO"], start_date=START_DATE).dropna()
+if upro_prices.empty:
+    raise ValueError("No UPRO prices were downloaded.")
+upro_return = upro_prices["UPRO"].pct_change()
+upro_forward_returns = add_forward_returns(upro_prices["UPRO"], FORWARD_RETURN_HORIZONS)
+
+derivatives_raw = load_derivatives_daily(DERIVATIVES_PATH_CANDIDATES)
+derivative_features = build_derivative_features(derivatives_raw)
+if not derivative_features.empty:
+    derivative_features = derivative_features.shift(DERIVATIVES_FEATURE_LAG_SESSIONS)
+btc_derivative_returns, btc_derivative_exposure = build_btc_derivative_signal_legs(
+    derivative_features,
+    upro_return,
+)
+if not btc_derivative_returns.empty:
+    signal_returns = signal_returns.join(btc_derivative_returns, how="inner").dropna()
+    per_signal_exposure = per_signal_exposure.reindex(signal_returns.index).fillna(0.0)
+    derivative_exposure_panel = pd.concat(
+        [
+            pd.DataFrame(
+                {"SPY": 0.0, "TLT": 0.0, "UPRO": btc_derivative_exposure[column].reindex(signal_returns.index).fillna(0.0)},
+                index=signal_returns.index,
+            )
+            for column in btc_derivative_exposure.columns
+        ],
+        axis=1,
+        keys=list(btc_derivative_exposure.columns),
+    )
+    per_signal_exposure = pd.concat([per_signal_exposure, derivative_exposure_panel], axis=1)
 signal_returns.tail(10)
+
+# %%
+upro_forward_returns.reindex(signal_returns.index).tail(10)
 
 # %% [markdown]
 # ## Methodology
 #
 # 1. Build daily return streams for the three SPY/TLT rules and the UPRO residual rule.
-# 2. Inner-join on dates so all legs are defined (sample starts when UPRO/BTC data allow).
-# 3. Apply fixed equal weights (`25%` per signal) to build portfolio returns.
-# 4. Compare standalone signal performance with the equal-weight blend.
-# 5. Measure pairwise signal correlation to check whether each added signal
+# 2. Add BTC-derivatives-based long/flat UPRO legs from lagged derivatives features when
+#    a local derivatives file is available.
+# 3. Compute UPRO forward returns (1/5/10/21-day) for cross-horizon diagnostics.
+# 4. Inner-join on dates so all legs are defined.
+# 5. Apply fixed equal weights across all active signals to build portfolio returns.
+# 6. Compare standalone signal performance with the equal-weight blend.
+# 7. Measure pairwise signal correlation to check whether each added signal
 #    increases diversification.
-# 6. Estimate each signal's beta to the S&P 500 proxy (SPY daily returns) to
+# 8. Estimate each signal's beta to the S&P 500 proxy (SPY daily returns) to
 #    separate directional market exposure from idiosyncratic edge.
-# 7. Export equal-weight implied ETF weights for production with
+# 9. Export equal-weight implied ETF weights for production with
 #    `scripts/export_equal_weight_portfolio_weights.py` (shared pipeline in
 #    `research.signal_portfolio_blend`).
 
@@ -287,25 +447,25 @@ signal_correlation
 signal_names = signal_returns.columns.tolist()
 upper_triangle_mask = np.triu(np.ones(signal_correlation.shape, dtype=bool), k=1)
 pairwise_correlations = signal_correlation.where(upper_triangle_mask).stack()
-spy_tlt_corr = signal_returns[[c for c in signal_names if c != "upro_residual"]].corr()
-spy_tlt_pairwise = spy_tlt_corr.where(np.triu(np.ones(spy_tlt_corr.shape, dtype=bool), k=1)).stack()
+base_corr = signal_returns[core_signal_names].corr()
+base_pairwise = base_corr.where(np.triu(np.ones(base_corr.shape, dtype=bool), k=1)).stack()
 diversification_summary = pd.DataFrame(
     {
         "metric": [
-            "avg_pairwise_corr_spy_tlt_only",
-            "avg_pairwise_corr_with_upro_residual",
-            "median_pairwise_corr_with_upro_residual",
-            "min_pairwise_corr_with_upro_residual",
-            "max_pairwise_corr_with_upro_residual",
-            "change_in_avg_pairwise_corr_after_adding_upro_residual",
+            "avg_pairwise_corr_base_signals",
+            "avg_pairwise_corr_all_signals",
+            "median_pairwise_corr_all_signals",
+            "min_pairwise_corr_all_signals",
+            "max_pairwise_corr_all_signals",
+            "change_in_avg_pairwise_corr_after_adding_derivative_signals",
         ],
         "value": [
-            spy_tlt_pairwise.mean(),
+            base_pairwise.mean(),
             pairwise_correlations.mean(),
             pairwise_correlations.median(),
             pairwise_correlations.min(),
             pairwise_correlations.max(),
-            pairwise_correlations.mean() - spy_tlt_pairwise.mean(),
+            pairwise_correlations.mean() - base_pairwise.mean(),
         ],
     }
 )
@@ -393,16 +553,17 @@ plt.show()
 # - Correlation and beta are estimated from historical daily close-to-close data
 #   and can shift materially across market regimes.
 # - Costs, turnover drag, and implementation constraints are not modeled.
-# - The inner join with the UPRO residual leg shortens the combined sample to
-#   dates where QQQ, UPRO, BTC, SPY, and TLT history all overlap.
+# - Any optional BTC-derivatives signal legs use a local derivatives dataset; if
+#   that file is missing, this notebook falls back to the core four signals.
+# - The inner join across active signal legs can shorten the combined sample.
 #
 # ## Conclusion
 #
-# This notebook backtests a combined portfolio of the three SPY/TLT signals
-# plus the BTC/QQQ residual UPRO rule using an explicit **equal-weight**
-# construction. The added diagnostics quantify whether the UPRO residual signal
-# diversifies the signal set (correlation analysis) and how much market exposure
-# each signal contributes (beta to SPY as S&P 500 proxy). Export daily weights with
+# This notebook backtests an equal-weight combined-signal portfolio using the
+# three SPY/TLT legs, the BTC/QQQ residual UPRO leg, and optional BTC-derivatives
+# UPRO signal legs. It also reports UPRO forward returns across multiple horizons
+# for diagnostic checks while comparing diversification (correlation) and market
+# exposure (beta to SPY proxy) across all active signals. Export daily weights with
 # `uv run python scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Next Research Ideas
