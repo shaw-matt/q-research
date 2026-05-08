@@ -5,10 +5,10 @@ on:
     branches:
       - main
   schedule:
-    # GitHub schedules use UTC. These cover 4 PM America/Chicago in
+    # GitHub schedules use UTC. These cover 4 AM America/Chicago in
     # daylight and standard time; the job below skips the non-matching run.
-    - cron: "0 21 * * *"
-    - cron: "0 22 * * *"
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
   workflow_dispatch:
 
 permissions:
