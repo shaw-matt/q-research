@@ -46,11 +46,26 @@ import requests
 from dotenv import load_dotenv
 from IPython.display import Markdown, display
 
-if "__file__" in globals():
-    _REPO_ROOT = Path(__file__).resolve().parents[2]
-else:
-    _cwd = Path.cwd().resolve()
-    _REPO_ROOT = _cwd if (_cwd / "research").is_dir() else _cwd.parents[1]
+
+def find_repo_root() -> Path:
+    """Find the repository root from either Quarto or notebook execution contexts."""
+    candidates = []
+    candidates.extend(
+        Path(raw).expanduser().resolve()
+        for raw in [os.getenv("Q_RESEARCH_REPO_ROOT"), os.getenv("PWD")]
+        if raw
+    )
+    if "__file__" in globals():
+        candidates.extend(Path(__file__).resolve().parents)
+    candidates.append(Path.cwd().resolve())
+    candidates.extend(Path.cwd().resolve().parents)
+    for candidate in candidates:
+        if (candidate / "research").is_dir() and (candidate / "notebooks").is_dir():
+            return candidate
+    raise RuntimeError("Could not find repository root containing research/ and notebooks/.")
+
+
+_REPO_ROOT = find_repo_root()
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -469,6 +484,13 @@ def assign_deciles(series: pd.Series) -> pd.Series:
     deciles = pd.Series(index=series.index, dtype="float64")
     if valid.empty:
         return deciles
+    if len(valid) < 10:
+        deciles.loc[valid.index] = pd.qcut(
+            valid.rank(method="first"),
+            q=len(valid),
+            labels=False,
+        ).astype(float) + 1.0
+        return deciles
     labels = range(1, 11)
     ranked = valid.rank(method="first")
     deciles.loc[valid.index] = pd.qcut(ranked, q=10, labels=labels).astype(float)
@@ -511,6 +533,11 @@ vx30 = build_vx30_series(futures_aggs)
 
 data = pd.concat([vx30["VX30"], vix3m.rename("VIX3M")], axis=1).dropna()
 data = data.loc[(data["VX30"] > 0) & (data["VIX3M"] > 0)].copy()
+if data.empty:
+    raise ValueError(
+        "No overlapping positive VX30/VIX3M observations were available. "
+        "Check the Massive index/futures entitlements, tickers, and date range."
+    )
 data = add_forward_log_returns(data, "VX30", FORWARD_RETURN_HORIZONS)
 data["vx30_log_return"] = np.log(data["VX30"] / data["VX30"].shift(1))
 data["cheapness_log_ratio"] = np.log(data["VX30"] / data["VIX3M"])
