@@ -13,14 +13,15 @@
 # ---
 
 # %% [markdown]
-# # Volatility-Targeted Portfolio of SPY/TLT Signals + BTC/QQQ Residual UPRO Signal
+# # Volatility-Targeted Portfolio of SPY/TLT, UPRO Residual, and Dirty VIX Signals
 #
 # ## Research Question
 #
 # If we build the same signal set used by the equal-weight portfolio notebook,
-# then scale the combined portfolio to a fixed volatility target, does the
-# volatility overlay improve realized risk control without materially diluting
-# risk-adjusted returns?
+# including the SPY/TLT rules, BTC/QQQ residual UPRO leg, and dirty VIX leg, then
+# scale the combined portfolio to a fixed volatility target, does the volatility
+# overlay improve realized risk control without materially diluting risk-adjusted
+# returns?
 #
 # **Portfolio decision for this notebook:** use the equal-weight notebook's
 # signal construction, keep the cross-signal blend at fixed `1/N` weights, and
@@ -29,10 +30,10 @@
 # ## Hypothesis
 #
 # The equal-weight signal blend has time-varying realized volatility because the
-# active signal mix changes across SPY, TLT, and UPRO. A volatility target should
-# reduce exposure after high-volatility periods and increase exposure after
-# low-volatility periods, producing a return stream with more stable risk than
-# the unscaled equal-weight blend.
+# active signal mix changes across SPY, TLT, UPRO, and VX30 proxy exposure. A
+# volatility target should reduce exposure after high-volatility periods and
+# increase exposure after low-volatility periods, producing a return stream with
+# more stable risk than the unscaled equal-weight blend.
 
 # %%
 from __future__ import annotations
@@ -84,7 +85,9 @@ apply_default_style()
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-#   5. Optional BTC-derivatives UPRO legs when supplemental derivatives data or
+#   5. Dirty VIX cheapness long VX30 proxy when `zscore(log(VX30 / VIX3M))`
+#      is below the entry threshold.
+#   6. Optional BTC-derivatives UPRO legs when supplemental derivatives data or
 #      Massive OPRA option access is available.
 # - Signals use daily close data and earn the next close-to-close return.
 # - The volatility target is estimated from trailing daily returns of the
@@ -101,6 +104,8 @@ apply_default_style()
 #   residual signal via `research.upro_residual`.
 # - Optional Massive REST OPRA option contracts/day-aggregates for IBIT/BITO
 #   proxy derivatives features, plus optional local BTC derivatives fields.
+# - Cboe public VIX3M history plus Yahoo `VX=F` (with Cboe VIX fallback) for
+#   the dirty VIX long-volatility proxy.
 
 # %%
 START_DATE = "2004-01-01"
