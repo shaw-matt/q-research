@@ -1,4 +1,4 @@
-"""Four-signal SPY/TLT + UPRO residual blend (same rules as the vol-target notebook)."""
+"""SPY/TLT + UPRO residual + dirty VIX blend (same rules as the portfolio notebook)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from research.data import download_massive_daily_closes
+from research.dirty_vix import build_dirty_vix_signal_frame
 from research.upro_residual import build_upro_residual_strategy_frame
 
 
@@ -23,6 +24,12 @@ class SignalPortfolioParams:
     beta_lookback_days: int = 40
     zscore_lookback_days: int = 20
     entry_zscore: float = 1.5
+    dirty_vix_start_date: str | None = None
+    dirty_vix_rolling_zscore_days: int = 252
+    dirty_vix_min_zscore_obs: int | None = None
+    dirty_vix_entry_zscore: float = -1.5
+    dirty_vix_execution_lag_sessions: int = 1
+    dirty_vix_yahoo_ticker: str = "VX=F"
 
 
 @dataclass(frozen=True)
@@ -30,6 +37,7 @@ class SignalPortfolioBundle:
     signal_returns: pd.DataFrame
     per_signal_exposure: pd.DataFrame
     upro_frame: pd.DataFrame
+    dirty_vix_frame: pd.DataFrame
 
 
 def build_eom_rebalance_returns(
@@ -132,36 +140,37 @@ def blend_signal_exposures(
     per_signal: pd.DataFrame,
     blend_weights: pd.Series,
 ) -> pd.DataFrame:
-    """Net SPY / TLT / UPRO weights per $1 of blended signal capital (pre vol overlay)."""
-    assets = ["SPY", "TLT", "UPRO"]
+    """Net asset weights per $1 of blended signal capital."""
+    if not isinstance(per_signal.columns, pd.MultiIndex):
+        raise ValueError("per_signal must have MultiIndex columns of (signal, asset).")
+    assets = list(dict.fromkeys(per_signal.columns.get_level_values(1)))
     out = pd.DataFrame(0.0, index=per_signal.index, columns=assets)
     for sig in blend_weights.index:
         w = float(blend_weights[sig])
+        if sig not in per_signal.columns.get_level_values(0):
+            continue
+        signal_exposure = per_signal[sig].reindex(columns=assets, fill_value=0.0).fillna(0.0)
         for a in assets:
-            out[a] = out[a] + w * per_signal[(sig, a)]
+            out[a] = out[a] + w * signal_exposure[a]
     return out
 
 
 def gross_exposure_shares(net: pd.DataFrame) -> pd.DataFrame:
-    """100% stacked shares: SPY long, TLT long, TLT short, UPRO long, cash/flat."""
-    spy = net["SPY"]
-    tlt = net["TLT"]
-    upro = net["UPRO"]
-    c_spy = spy.clip(lower=0.0)
-    c_tlt_long = tlt.clip(lower=0.0)
-    c_tlt_short = (-tlt).clip(lower=0.0)
-    c_upro = upro.clip(lower=0.0)
-    gross = c_spy + c_tlt_long + c_tlt_short + c_upro
+    """100% stacked shares of gross long/short exposure plus cash/flat."""
+    if net.empty:
+        return pd.DataFrame(index=net.index)
+    cleaned = net.fillna(0.0)
+    gross = cleaned.abs().sum(axis=1)
     denom = gross.replace(0.0, np.nan)
-    parts = pd.DataFrame(
-        {
-            "SPY": (c_spy / denom).fillna(0.0),
-            "TLT long": (c_tlt_long / denom).fillna(0.0),
-            "TLT short": (c_tlt_short / denom).fillna(0.0),
-            "UPRO": (c_upro / denom).fillna(0.0),
-        },
-        index=net.index,
-    )
+    parts = pd.DataFrame(index=cleaned.index)
+    for asset in cleaned.columns:
+        long_exposure = cleaned[asset].clip(lower=0.0)
+        short_exposure = (-cleaned[asset]).clip(lower=0.0)
+        if (short_exposure > 0.0).any():
+            parts[f"{asset} long"] = (long_exposure / denom).fillna(0.0)
+            parts[f"{asset} short"] = (short_exposure / denom).fillna(0.0)
+        else:
+            parts[str(asset)] = (long_exposure / denom).fillna(0.0)
     cash = (gross <= 0.0).astype(float)
     parts = parts.mul((gross > 0.0).astype(float), axis=0)
     parts["Cash / flat"] = cash
@@ -181,6 +190,7 @@ def build_signal_portfolio_bundle(
     p = params or SignalPortfolioParams()
     end = pd.Timestamp.now(tz=UTC).date().isoformat()
     residual_start = p.residual_start_date or p.start_date
+    dirty_vix_start = p.dirty_vix_start_date or p.start_date
     if data_source == "rest":
         from research.massive_rest import download_rest_stock_day_closes
 
@@ -209,9 +219,26 @@ def build_signal_portfolio_bundle(
     )
     upro_returns = upro_frame["strategy_return"].rename("upro_residual")
 
-    signal_returns = spy_tlt_returns.join(upro_returns, how="inner").dropna()
+    dirty_vix_frame = build_dirty_vix_signal_frame(
+        start_date=dirty_vix_start,
+        end_date=end,
+        rolling_zscore_days=p.dirty_vix_rolling_zscore_days,
+        min_zscore_obs=p.dirty_vix_min_zscore_obs,
+        entry_zscore=p.dirty_vix_entry_zscore,
+        execution_lag_sessions=p.dirty_vix_execution_lag_sessions,
+        yahoo_vx_ticker=p.dirty_vix_yahoo_ticker,
+    )
+    dirty_vix_returns = dirty_vix_frame["strategy_return"].rename("dirty_vix")
+
+    signal_returns = pd.concat(
+        [spy_tlt_returns, upro_returns, dirty_vix_returns],
+        axis=1,
+        join="inner",
+    ).dropna()
     if signal_returns.empty:
-        raise ValueError("No overlapping history after joining SPY/TLT signals with UPRO residual.")
+        raise ValueError(
+            "No overlapping history after joining SPY/TLT, UPRO residual, and dirty VIX signals."
+        )
 
     cols = list(signal_returns.columns)
     per_signal_exposure = pd.concat(
@@ -224,6 +251,18 @@ def build_signal_portfolio_bundle(
                     "SPY": 0.0,
                     "TLT": 0.0,
                     "UPRO": upro_frame["upro_exposure"].reindex(signal_returns.index).fillna(0.0),
+                    "VX30": 0.0,
+                },
+                index=signal_returns.index,
+            ),
+            pd.DataFrame(
+                {
+                    "SPY": 0.0,
+                    "TLT": 0.0,
+                    "UPRO": 0.0,
+                    "VX30": dirty_vix_frame["vx30_exposure"]
+                    .reindex(signal_returns.index)
+                    .fillna(0.0),
                 },
                 index=signal_returns.index,
             ),
@@ -236,6 +275,7 @@ def build_signal_portfolio_bundle(
         signal_returns=signal_returns,
         per_signal_exposure=per_signal_exposure,
         upro_frame=upro_frame,
+        dirty_vix_frame=dirty_vix_frame,
     )
 
 
