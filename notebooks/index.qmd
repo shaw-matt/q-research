@@ -10,3 +10,4 @@ This site contains rendered research notebooks.
 - [Short-Term SPY/TLT Relative Reversal](examples/spy-tlt-short-term-reversal.html)
 - [TLT Turn-of-Month Effect](examples/tlt-turn-of-month-effect.html)
 - [Equal-Weight Portfolio of SPY/TLT Signals + BTC/QQQ Residual UPRO Signal](examples/spy-tlt-signal-portfolio-vol-target.html)
+- [Dirty VIX Futures Cheapness Signal vs VIX3M](examples/vix-futures-cheapness-vix3m.html)
