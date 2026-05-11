@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -150,6 +151,11 @@ def request_json(
         raise ValueError(
             "Massive REST returned 401 Unauthorized. Confirm the API key and that "
             "the subscription includes indices and futures data."
+        )
+    if response.status_code == 403:
+        raise ValueError(
+            "Massive REST returned 403 Forbidden. The API key is valid, but the "
+            "account is not entitled to this endpoint/ticker."
         )
     response.raise_for_status()
     payload = response.json()
@@ -519,6 +525,29 @@ def strategy_returns(
     return out
 
 
+def safe_exception_message(exc: BaseException) -> str:
+    """Keep API keys out of rendered notebook output and logs."""
+    message = str(exc)
+    key = (
+        os.getenv("MASSIVE_API_KEY")
+        or os.getenv("POLYGON_API_KEY")
+        or os.getenv("POLYGON_API_KEY_ID")
+        or ""
+    )
+    if key:
+        message = message.replace(key, "***")
+    return re.sub(r"([?&]apiKey=)[^&\s]+", r"\1***", message)
+
+
+def display_data_unavailable(section: str) -> None:
+    display(
+        Markdown(
+            f"**{section} skipped.** Required Massive VIX3M/VX data did not load: "
+            f"`{DATA_LOAD_ERROR}`"
+        )
+    )
+
+
 # %% [markdown]
 # ## Load Massive Data
 #
@@ -527,31 +556,44 @@ def strategy_returns(
 # how `VX30` is built and makes the interpolation auditable.
 
 # %%
-vix3m = download_massive_daily_closes(VIX3M_TICKER, START_DATE, END_DATE)
-contracts, futures_aggs = load_vx_futures_panel(START_DATE, END_DATE)
-vx30 = build_vx30_series(futures_aggs)
+DATA_AVAILABLE = False
+DATA_LOAD_ERROR: str | None = None
+vix3m = pd.Series(dtype=float, name=VIX3M_TICKER)
+contracts = pd.DataFrame()
+futures_aggs = pd.DataFrame()
+vx30 = pd.DataFrame()
+data = pd.DataFrame()
 
-data = pd.concat([vx30["VX30"], vix3m.rename("VIX3M")], axis=1).dropna()
-data = data.loc[(data["VX30"] > 0) & (data["VIX3M"] > 0)].copy()
-if data.empty:
-    raise ValueError(
-        "No overlapping positive VX30/VIX3M observations were available. "
-        "Check the Massive index/futures entitlements, tickers, and date range."
-    )
-data = add_forward_log_returns(data, "VX30", FORWARD_RETURN_HORIZONS)
-data["vx30_log_return"] = np.log(data["VX30"] / data["VX30"].shift(1))
-data["cheapness_log_ratio"] = np.log(data["VX30"] / data["VIX3M"])
-rolling = data["cheapness_log_ratio"].rolling(ROLLING_ZSCORE_DAYS, min_periods=MIN_ZSCORE_OBS)
-data["cheapness_zscore"] = (
-    data["cheapness_log_ratio"] - rolling.mean()
-) / rolling.std(ddof=0)
-data["cheapness_zscore_lag1"] = data["cheapness_zscore"].shift(1)
-data["decile"] = assign_deciles(data["cheapness_zscore"])
-data["decile_lag1"] = assign_deciles(data["cheapness_zscore_lag1"])
+try:
+    vix3m = download_massive_daily_closes(VIX3M_TICKER, START_DATE, END_DATE)
+    contracts, futures_aggs = load_vx_futures_panel(START_DATE, END_DATE)
+    vx30 = build_vx30_series(futures_aggs)
 
-display(
-    Markdown(
-        f"""
+    data = pd.concat([vx30["VX30"], vix3m.rename("VIX3M")], axis=1).dropna()
+    data = data.loc[(data["VX30"] > 0) & (data["VIX3M"] > 0)].copy()
+    if data.empty:
+        raise ValueError(
+            "No overlapping positive VX30/VIX3M observations were available. "
+            "Check the Massive index/futures entitlements, tickers, and date range."
+        )
+    data = add_forward_log_returns(data, "VX30", FORWARD_RETURN_HORIZONS)
+    data["vx30_log_return"] = np.log(data["VX30"] / data["VX30"].shift(1))
+    data["cheapness_log_ratio"] = np.log(data["VX30"] / data["VIX3M"])
+    rolling = data["cheapness_log_ratio"].rolling(ROLLING_ZSCORE_DAYS, min_periods=MIN_ZSCORE_OBS)
+    data["cheapness_zscore"] = (
+        data["cheapness_log_ratio"] - rolling.mean()
+    ) / rolling.std(ddof=0)
+    data["cheapness_zscore_lag1"] = data["cheapness_zscore"].shift(1)
+    data["decile"] = assign_deciles(data["cheapness_zscore"])
+    data["decile_lag1"] = assign_deciles(data["cheapness_zscore_lag1"])
+    DATA_AVAILABLE = True
+except (ValueError, requests.HTTPError, requests.RequestException) as exc:
+    DATA_LOAD_ERROR = safe_exception_message(exc)
+
+if DATA_AVAILABLE:
+    display(
+        Markdown(
+            f"""
 Loaded **{len(data):,}** aligned VX30/VIX3M observations from **{data.index.min().date()}**
 through **{data.index.max().date()}**.
 
@@ -559,10 +601,22 @@ through **{data.index.max().date()}**.
 - VX futures session rows after DTE filters: **{len(futures_aggs):,}**
 - VX30 construction mix:
 """
+        )
     )
-)
-display(vx30["construction"].value_counts().to_frame("sessions"))
-display(data[["VX30", "VIX3M", "cheapness_log_ratio", "cheapness_zscore"]].tail())
+    display(vx30["construction"].value_counts().to_frame("sessions"))
+    display(data[["VX30", "VIX3M", "cheapness_log_ratio", "cheapness_zscore"]].tail())
+else:
+    display(
+        Markdown(
+            "### Massive data unavailable\n\n"
+            f"The notebook structure rendered, but the live Massive request needed "
+            f"for this study failed: `{DATA_LOAD_ERROR}`\n\n"
+            "The publish workflow currently has a Massive REST key, but the log "
+            "shows it is not entitled to the VIX3M index aggregate endpoint. "
+            "Grant index/VIX3M access or pre-populate the configured Massive REST "
+            "cache to render the full analysis."
+        )
+    )
 
 # %% [markdown]
 # ## Visual Check
@@ -571,18 +625,21 @@ display(data[["VX30", "VIX3M", "cheapness_log_ratio", "cheapness_zscore"]].tail(
 # z-scores mean VX30 is cheap versus its own recent history against VIX3M.
 
 # %%
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-data[["VX30", "VIX3M"]].plot(ax=axes[0], lw=1.2)
-axes[0].set_title("VX30 proxy vs VIX3M")
-axes[0].set_ylabel("Index / futures price")
+if DATA_AVAILABLE:
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    data[["VX30", "VIX3M"]].plot(ax=axes[0], lw=1.2)
+    axes[0].set_title("VX30 proxy vs VIX3M")
+    axes[0].set_ylabel("Index / futures price")
 
-data["cheapness_zscore"].plot(ax=axes[1], color="tab:purple", lw=1.0)
-axes[1].axhline(ENTRY_ZSCORE, color="tab:red", ls="--", label=f"entry z = {ENTRY_ZSCORE:g}")
-axes[1].axhline(0, color="black", lw=0.8)
-axes[1].set_title("252-day z-score of log(VX30 / VIX3M)")
-axes[1].set_ylabel("z-score")
-axes[1].legend()
-plt.tight_layout()
+    data["cheapness_zscore"].plot(ax=axes[1], color="tab:purple", lw=1.0)
+    axes[1].axhline(ENTRY_ZSCORE, color="tab:red", ls="--", label=f"entry z = {ENTRY_ZSCORE:g}")
+    axes[1].axhline(0, color="black", lw=0.8)
+    axes[1].set_title("252-day z-score of log(VX30 / VIX3M)")
+    axes[1].set_ylabel("z-score")
+    axes[1].legend()
+    plt.tight_layout()
+else:
+    display_data_unavailable("Visual check")
 
 # %% [markdown]
 # ## Dirty Decile Sort
@@ -592,55 +649,63 @@ plt.tight_layout()
 # richest 10%.
 
 # %%
-decile_summary = (
-    data.dropna(subset=["decile", "vx30_fwd_1d_log_return"])
-    .groupby("decile")
-    .agg(
-        observations=("vx30_fwd_1d_log_return", "size"),
-        mean_next_day_log_return=("vx30_fwd_1d_log_return", "mean"),
-        median_next_day_log_return=("vx30_fwd_1d_log_return", "median"),
-        positive_rate=("vx30_fwd_1d_log_return", lambda x: float((x > 0).mean())),
-        mean_zscore=("cheapness_zscore", "mean"),
+if DATA_AVAILABLE:
+    decile_summary = (
+        data.dropna(subset=["decile", "vx30_fwd_1d_log_return"])
+        .groupby("decile")
+        .agg(
+            observations=("vx30_fwd_1d_log_return", "size"),
+            mean_next_day_log_return=("vx30_fwd_1d_log_return", "mean"),
+            median_next_day_log_return=("vx30_fwd_1d_log_return", "median"),
+            positive_rate=("vx30_fwd_1d_log_return", lambda x: float((x > 0).mean())),
+            mean_zscore=("cheapness_zscore", "mean"),
+        )
     )
-)
 
-decile_summary_lag1 = (
-    data.dropna(subset=["decile_lag1", "vx30_fwd_1d_log_return"])
-    .groupby("decile_lag1")
-    .agg(
-        observations=("vx30_fwd_1d_log_return", "size"),
-        mean_next_day_log_return=("vx30_fwd_1d_log_return", "mean"),
-        median_next_day_log_return=("vx30_fwd_1d_log_return", "median"),
-        positive_rate=("vx30_fwd_1d_log_return", lambda x: float((x > 0).mean())),
-        mean_lagged_zscore=("cheapness_zscore_lag1", "mean"),
+    decile_summary_lag1 = (
+        data.dropna(subset=["decile_lag1", "vx30_fwd_1d_log_return"])
+        .groupby("decile_lag1")
+        .agg(
+            observations=("vx30_fwd_1d_log_return", "size"),
+            mean_next_day_log_return=("vx30_fwd_1d_log_return", "mean"),
+            median_next_day_log_return=("vx30_fwd_1d_log_return", "median"),
+            positive_rate=("vx30_fwd_1d_log_return", lambda x: float((x > 0).mean())),
+            mean_lagged_zscore=("cheapness_zscore_lag1", "mean"),
+        )
     )
-)
 
-display(
-    decile_summary.style.format(
-        {
-            "observations": "{:.0f}",
-            "mean_next_day_log_return": "{:.3%}",
-            "median_next_day_log_return": "{:.3%}",
-            "positive_rate": "{:.1%}",
-            "mean_zscore": "{:.2f}",
-        }
+    display(
+        decile_summary.style.format(
+            {
+                "observations": "{:.0f}",
+                "mean_next_day_log_return": "{:.3%}",
+                "median_next_day_log_return": "{:.3%}",
+                "positive_rate": "{:.1%}",
+                "mean_zscore": "{:.2f}",
+            }
+        )
     )
-)
+else:
+    decile_summary = pd.DataFrame()
+    decile_summary_lag1 = pd.DataFrame()
+    display_data_unavailable("Decile sort")
 
 # %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
-(decile_summary["mean_next_day_log_return"] * 100).plot.bar(ax=axes[0], color="tab:blue")
-axes[0].axhline(0, color="black", lw=0.8)
-axes[0].set_title("Same-day signal sort")
-axes[0].set_xlabel("Cheapness z-score decile")
-axes[0].set_ylabel("Mean next-day VX30 log return (%)")
+if DATA_AVAILABLE and not decile_summary.empty and not decile_summary_lag1.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+    (decile_summary["mean_next_day_log_return"] * 100).plot.bar(ax=axes[0], color="tab:blue")
+    axes[0].axhline(0, color="black", lw=0.8)
+    axes[0].set_title("Same-day signal sort")
+    axes[0].set_xlabel("Cheapness z-score decile")
+    axes[0].set_ylabel("Mean next-day VX30 log return (%)")
 
-(decile_summary_lag1["mean_next_day_log_return"] * 100).plot.bar(ax=axes[1], color="tab:orange")
-axes[1].axhline(0, color="black", lw=0.8)
-axes[1].set_title("Signal lagged by one session")
-axes[1].set_xlabel("Lagged cheapness z-score decile")
-plt.tight_layout()
+    (decile_summary_lag1["mean_next_day_log_return"] * 100).plot.bar(ax=axes[1], color="tab:orange")
+    axes[1].axhline(0, color="black", lw=0.8)
+    axes[1].set_title("Signal lagged by one session")
+    axes[1].set_xlabel("Lagged cheapness z-score decile")
+    plt.tight_layout()
+else:
+    display_data_unavailable("Decile chart")
 
 # %% [markdown]
 # ## Forward Return Diagnostics
@@ -649,21 +714,25 @@ plt.tight_layout()
 # return horizons. These are diagnostics, not a trade implementation.
 
 # %%
-forward_summary = []
-for horizon in FORWARD_RETURN_HORIZONS:
-    column = f"vx30_fwd_{horizon}d_log_return"
-    grouped = data.dropna(subset=["decile", column]).groupby("decile")[column].mean()
-    forward_summary.append(grouped.rename(f"{horizon}d"))
-forward_summary = pd.concat(forward_summary, axis=1)
-display(forward_summary.style.format("{:.3%}"))
+if DATA_AVAILABLE:
+    forward_summary = []
+    for horizon in FORWARD_RETURN_HORIZONS:
+        column = f"vx30_fwd_{horizon}d_log_return"
+        grouped = data.dropna(subset=["decile", column]).groupby("decile")[column].mean()
+        forward_summary.append(grouped.rename(f"{horizon}d"))
+    forward_summary = pd.concat(forward_summary, axis=1)
+    display(forward_summary.style.format("{:.3%}"))
 
-fig, ax = plt.subplots(figsize=(11, 5))
-(forward_summary * 100).plot(marker="o", ax=ax)
-ax.axhline(0, color="black", lw=0.8)
-ax.set_title("Mean VX30 forward log returns by cheapness decile")
-ax.set_xlabel("Cheapness z-score decile")
-ax.set_ylabel("Mean forward log return (%)")
-plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(11, 5))
+    (forward_summary * 100).plot(marker="o", ax=ax)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_title("Mean VX30 forward log returns by cheapness decile")
+    ax.set_xlabel("Cheapness z-score decile")
+    ax.set_ylabel("Mean forward log return (%)")
+    plt.tight_layout()
+else:
+    forward_summary = pd.DataFrame()
+    display_data_unavailable("Forward return diagnostics")
 
 # %% [markdown]
 # ## Threshold Strategy
@@ -678,80 +747,90 @@ plt.tight_layout()
 # signal, matching the stricter "lag it by a day" check.
 
 # %%
-same_day_strategy = strategy_returns(
-    data["cheapness_zscore"],
-    data["vx30_fwd_1d_log_return"],
-    threshold=ENTRY_ZSCORE,
-    execution_lag_sessions=0,
-)
-lagged_strategy = strategy_returns(
-    data["cheapness_zscore"],
-    data["vx30_fwd_1d_log_return"],
-    threshold=ENTRY_ZSCORE,
-    execution_lag_sessions=1,
-)
-
-strategy_summary = pd.concat(
-    {
-        "Always long VX30": summarize_log_returns(data["vx30_fwd_1d_log_return"]),
-        f"Long VX30 z < {ENTRY_ZSCORE:g}": summarize_log_returns(
-            same_day_strategy["strategy_log_return"]
-        ),
-        f"Long VX30 z < {ENTRY_ZSCORE:g}, lag 1": summarize_log_returns(
-            lagged_strategy["strategy_log_return"]
-        ),
-    },
-    axis=1,
-).T
-strategy_summary["exposure"] = [
-    1.0,
-    same_day_strategy["position"].mean(),
-    lagged_strategy["position"].mean(),
-]
-strategy_summary["trades_per_year"] = [
-    np.nan,
-    same_day_strategy["trade"].sum() / len(same_day_strategy) * TRADING_DAYS_PER_YEAR,
-    lagged_strategy["trade"].sum() / len(lagged_strategy) * TRADING_DAYS_PER_YEAR,
-]
-display(
-    strategy_summary.style.format(
-        {
-            "observations": "{:.0f}",
-            "total_return": "{:.1%}",
-            "ann_return": "{:.1%}",
-            "ann_vol": "{:.1%}",
-            "sharpe": "{:.2f}",
-            "max_drawdown": "{:.1%}",
-            "positive_days": "{:.1%}",
-            "exposure": "{:.1%}",
-            "trades_per_year": "{:.1f}",
-        }
+if DATA_AVAILABLE:
+    same_day_strategy = strategy_returns(
+        data["cheapness_zscore"],
+        data["vx30_fwd_1d_log_return"],
+        threshold=ENTRY_ZSCORE,
+        execution_lag_sessions=0,
     )
-)
+    lagged_strategy = strategy_returns(
+        data["cheapness_zscore"],
+        data["vx30_fwd_1d_log_return"],
+        threshold=ENTRY_ZSCORE,
+        execution_lag_sessions=1,
+    )
+
+    strategy_summary = pd.concat(
+        {
+            "Always long VX30": summarize_log_returns(data["vx30_fwd_1d_log_return"]),
+            f"Long VX30 z < {ENTRY_ZSCORE:g}": summarize_log_returns(
+                same_day_strategy["strategy_log_return"]
+            ),
+            f"Long VX30 z < {ENTRY_ZSCORE:g}, lag 1": summarize_log_returns(
+                lagged_strategy["strategy_log_return"]
+            ),
+        },
+        axis=1,
+    ).T
+    strategy_summary["exposure"] = [
+        1.0,
+        same_day_strategy["position"].mean(),
+        lagged_strategy["position"].mean(),
+    ]
+    strategy_summary["trades_per_year"] = [
+        np.nan,
+        same_day_strategy["trade"].sum() / len(same_day_strategy) * TRADING_DAYS_PER_YEAR,
+        lagged_strategy["trade"].sum() / len(lagged_strategy) * TRADING_DAYS_PER_YEAR,
+    ]
+    display(
+        strategy_summary.style.format(
+            {
+                "observations": "{:.0f}",
+                "total_return": "{:.1%}",
+                "ann_return": "{:.1%}",
+                "ann_vol": "{:.1%}",
+                "sharpe": "{:.2f}",
+                "max_drawdown": "{:.1%}",
+                "positive_days": "{:.1%}",
+                "exposure": "{:.1%}",
+                "trades_per_year": "{:.1f}",
+            }
+        )
+    )
+else:
+    same_day_strategy = pd.DataFrame()
+    lagged_strategy = pd.DataFrame()
+    strategy_summary = pd.DataFrame()
+    display_data_unavailable("Threshold strategy")
 
 # %%
-equity = pd.DataFrame(
-    {
-        "Always long VX30": np.exp(data["vx30_fwd_1d_log_return"].fillna(0).cumsum()),
-        f"z < {ENTRY_ZSCORE:g}": np.exp(
-            same_day_strategy["strategy_log_return"].fillna(0).cumsum()
-        ),
-        f"z < {ENTRY_ZSCORE:g}, lag 1": np.exp(
-            lagged_strategy["strategy_log_return"].fillna(0).cumsum()
-        ),
-    }
-)
+if DATA_AVAILABLE:
+    equity = pd.DataFrame(
+        {
+            "Always long VX30": np.exp(data["vx30_fwd_1d_log_return"].fillna(0).cumsum()),
+            f"z < {ENTRY_ZSCORE:g}": np.exp(
+                same_day_strategy["strategy_log_return"].fillna(0).cumsum()
+            ),
+            f"z < {ENTRY_ZSCORE:g}, lag 1": np.exp(
+                lagged_strategy["strategy_log_return"].fillna(0).cumsum()
+            ),
+        }
+    )
 
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-equity.plot(ax=axes[0], lw=1.3)
-axes[0].set_title("Dirty VX30 cheapness strategy equity curves")
-axes[0].set_ylabel("Growth of $1")
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    equity.plot(ax=axes[0], lw=1.3)
+    axes[0].set_title("Dirty VX30 cheapness strategy equity curves")
+    axes[0].set_ylabel("Growth of $1")
 
-lagged_strategy["position"].plot(ax=axes[1], color="tab:green", lw=0.9)
-axes[1].set_title("Lagged strategy position")
-axes[1].set_ylabel("Long VX30 exposure")
-axes[1].set_ylim(-0.05, 1.05)
-plt.tight_layout()
+    lagged_strategy["position"].plot(ax=axes[1], color="tab:green", lw=0.9)
+    axes[1].set_title("Lagged strategy position")
+    axes[1].set_ylabel("Long VX30 exposure")
+    axes[1].set_ylim(-0.05, 1.05)
+    plt.tight_layout()
+else:
+    equity = pd.DataFrame()
+    display_data_unavailable("Equity curve")
 
 # %% [markdown]
 # ## Threshold Sensitivity
@@ -760,61 +839,68 @@ plt.tight_layout()
 # interpretation because it requires waiting one full session after the signal.
 
 # %%
-threshold_rows = []
-for threshold in THRESHOLD_GRID:
-    for lag in [0, 1]:
-        sim = strategy_returns(
-            data["cheapness_zscore"],
-            data["vx30_fwd_1d_log_return"],
-            threshold=threshold,
-            execution_lag_sessions=lag,
-        )
-        summary = summarize_log_returns(sim["strategy_log_return"])
-        threshold_rows.append(
+if DATA_AVAILABLE:
+    threshold_rows = []
+    for threshold in THRESHOLD_GRID:
+        for lag in [0, 1]:
+            sim = strategy_returns(
+                data["cheapness_zscore"],
+                data["vx30_fwd_1d_log_return"],
+                threshold=threshold,
+                execution_lag_sessions=lag,
+            )
+            summary = summarize_log_returns(sim["strategy_log_return"])
+            threshold_rows.append(
+                {
+                    "threshold": threshold,
+                    "lag_sessions": lag,
+                    "ann_return": summary.get("ann_return", np.nan),
+                    "ann_vol": summary.get("ann_vol", np.nan),
+                    "sharpe": summary.get("sharpe", np.nan),
+                    "max_drawdown": summary.get("max_drawdown", np.nan),
+                    "exposure": sim["position"].mean(),
+                    "trades_per_year": sim["trade"].sum() / len(sim) * TRADING_DAYS_PER_YEAR,
+                }
+            )
+    threshold_sensitivity = pd.DataFrame(threshold_rows)
+    display(
+        threshold_sensitivity.style.format(
             {
-                "threshold": threshold,
-                "lag_sessions": lag,
-                "ann_return": summary.get("ann_return", np.nan),
-                "ann_vol": summary.get("ann_vol", np.nan),
-                "sharpe": summary.get("sharpe", np.nan),
-                "max_drawdown": summary.get("max_drawdown", np.nan),
-                "exposure": sim["position"].mean(),
-                "trades_per_year": sim["trade"].sum() / len(sim) * TRADING_DAYS_PER_YEAR,
+                "threshold": "{:.2f}",
+                "ann_return": "{:.1%}",
+                "ann_vol": "{:.1%}",
+                "sharpe": "{:.2f}",
+                "max_drawdown": "{:.1%}",
+                "exposure": "{:.1%}",
+                "trades_per_year": "{:.1f}",
             }
         )
-threshold_sensitivity = pd.DataFrame(threshold_rows)
-display(
-    threshold_sensitivity.style.format(
-        {
-            "threshold": "{:.2f}",
-            "ann_return": "{:.1%}",
-            "ann_vol": "{:.1%}",
-            "sharpe": "{:.2f}",
-            "max_drawdown": "{:.1%}",
-            "exposure": "{:.1%}",
-            "trades_per_year": "{:.1f}",
-        }
     )
-)
+else:
+    threshold_sensitivity = pd.DataFrame()
+    display_data_unavailable("Threshold sensitivity")
 
 # %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True)
-for lag, group in threshold_sensitivity.groupby("lag_sessions"):
-    label = "same day" if lag == 0 else "lag 1 session"
-    axes[0].plot(group["threshold"], group["sharpe"], marker="o", label=label)
-    axes[1].plot(group["threshold"], group["ann_return"] * 100, marker="o", label=label)
-axes[0].axhline(0, color="black", lw=0.8)
-axes[0].set_title("Sharpe by entry threshold")
-axes[0].set_xlabel("Entry z-score")
-axes[0].set_ylabel("Sharpe")
-axes[0].legend()
+if DATA_AVAILABLE and not threshold_sensitivity.empty:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True)
+    for lag, group in threshold_sensitivity.groupby("lag_sessions"):
+        label = "same day" if lag == 0 else "lag 1 session"
+        axes[0].plot(group["threshold"], group["sharpe"], marker="o", label=label)
+        axes[1].plot(group["threshold"], group["ann_return"] * 100, marker="o", label=label)
+    axes[0].axhline(0, color="black", lw=0.8)
+    axes[0].set_title("Sharpe by entry threshold")
+    axes[0].set_xlabel("Entry z-score")
+    axes[0].set_ylabel("Sharpe")
+    axes[0].legend()
 
-axes[1].axhline(0, color="black", lw=0.8)
-axes[1].set_title("Annualized log-return by entry threshold")
-axes[1].set_xlabel("Entry z-score")
-axes[1].set_ylabel("Annualized return (%)")
-axes[1].legend()
-plt.tight_layout()
+    axes[1].axhline(0, color="black", lw=0.8)
+    axes[1].set_title("Annualized log-return by entry threshold")
+    axes[1].set_xlabel("Entry z-score")
+    axes[1].set_ylabel("Annualized return (%)")
+    axes[1].legend()
+    plt.tight_layout()
+else:
+    display_data_unavailable("Threshold sensitivity chart")
 
 # %% [markdown]
 # ## Limitations
