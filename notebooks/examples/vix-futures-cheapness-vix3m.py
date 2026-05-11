@@ -34,11 +34,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-import time
-from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Any
 from urllib.parse import quote
 
 import matplotlib.pyplot as plt
@@ -106,12 +103,8 @@ apply_default_style()
 START_DATE = os.getenv("VIX_CHEAPNESS_START_DATE", "2020-01-01")
 END_DATE = os.getenv("VIX_CHEAPNESS_END_DATE", pd.Timestamp.today(tz="UTC").date().isoformat())
 
-VIX3M_TICKER = os.getenv("VIX3M_TICKER", "VIX3M")
-VX_PRODUCT_CODE = os.getenv("VX_PRODUCT_CODE", "VX")
 YAHOO_VX_TICKER = os.getenv("VIX_CHEAPNESS_YAHOO_VX_TICKER", "VX=F")
 
-TARGET_DTE_DAYS = int(os.getenv("VX_TARGET_DTE_DAYS", "30"))
-MAX_CONTRACT_DTE_DAYS = int(os.getenv("VX_MAX_CONTRACT_DTE_DAYS", "120"))
 ROLLING_ZSCORE_DAYS = int(os.getenv("VIX_CHEAPNESS_ZSCORE_DAYS", "252"))
 MIN_ZSCORE_OBS = int(os.getenv("VIX_CHEAPNESS_MIN_ZSCORE_OBS", str(ROLLING_ZSCORE_DAYS)))
 ENTRY_ZSCORE = float(os.getenv("VIX_CHEAPNESS_ENTRY_ZSCORE", "-1.5"))
@@ -123,69 +116,6 @@ THRESHOLD_GRID = np.round(np.arange(-2.50, -0.45, 0.25), 2)
 REST_CACHE_DIR = Path(
     os.getenv("Q_RESEARCH_PUBLIC_VOL_CACHE_DIR", ".cache/q-research/public-vol-data")
 )
-
-
-def massive_api_key() -> str:
-    key = (
-        os.getenv("MASSIVE_API_KEY")
-        or os.getenv("POLYGON_API_KEY")
-        or os.getenv("POLYGON_API_KEY_ID")
-        or ""
-    )
-    if not key:
-        raise ValueError(
-            "Massive REST requires an API key. Set MASSIVE_API_KEY or POLYGON_API_KEY."
-        )
-    return key
-
-
-def request_json(
-    session: requests.Session,
-    url: str,
-    params: dict[str, Any],
-    *,
-    api_key: str,
-) -> dict[str, Any]:
-    response = session.get(url, params=params, timeout=120)
-    if response.status_code == 401:
-        raise ValueError(
-            "Massive REST returned 401 Unauthorized. Confirm the API key and that "
-            "the subscription includes indices and futures data."
-        )
-    if response.status_code == 403:
-        raise ValueError(
-            "Massive REST returned 403 Forbidden. The API key is valid, but the "
-            "account is not entitled to this endpoint/ticker."
-        )
-    response.raise_for_status()
-    payload = response.json()
-    status = payload.get("status")
-    if status not in ("OK", "DELAYED"):
-        raise ValueError(f"Massive REST unexpected status {status!r}: {payload}")
-    return payload
-
-
-def fetch_paginated(
-    session: requests.Session,
-    initial_url: str,
-    params: dict[str, Any],
-    *,
-    api_key: str,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    next_url: str | None = initial_url
-    first = True
-    while next_url:
-        page_params = params if first else {}
-        if not first and "apikey=" not in next_url.lower():
-            page_params = {"apiKey": api_key}
-        payload = request_json(session, next_url, page_params, api_key=api_key)
-        rows.extend(payload.get("results") or [])
-        next_url = payload.get("next_url")
-        first = False
-        if next_url:
-            time.sleep(0.05)
-    return rows
 
 
 def cache_path(*parts: str) -> Path:
@@ -338,255 +268,6 @@ def load_public_vol_proxy_data(
         )
 
     return vix3m_series, proxy.rename("VX30"), pd.DataFrame(status_rows)
-
-
-def download_massive_daily_closes(
-    ticker: str,
-    start_date: str,
-    end_date: str,
-) -> pd.Series:
-    path = cache_path("daily-closes", f"{ticker}_{start_date}_{end_date}.parquet")
-    cached = read_cached_frame(path)
-    if cached is not None:
-        return cached["close"].rename(ticker)
-
-    api_key = massive_api_key()
-    session = requests.Session()
-    enc = quote(ticker, safe="")
-    url = f"{MASSIVE_REST_BASE}/v2/aggs/ticker/{enc}/range/1/day/{start_date}/{end_date}"
-    params: dict[str, Any] = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": api_key,
-    }
-    rows = fetch_paginated(session, url, params, api_key=api_key)
-    if not rows:
-        raise ValueError(f"No Massive aggregate rows returned for {ticker}.")
-
-    records = []
-    for row in rows:
-        date = pd.Timestamp(int(row["t"]), unit="ms", tz="UTC")
-        session_date = date.tz_convert("America/New_York").normalize().tz_localize(None)
-        records.append({"date": session_date, "close": float(row["c"])})
-    frame = pd.DataFrame.from_records(records).drop_duplicates("date", keep="last")
-    frame = frame.sort_values("date").set_index("date")
-    frame.index = pd.to_datetime(frame.index).normalize()
-    write_cached_frame(path, frame)
-    return frame["close"].rename(ticker)
-
-
-@dataclass(frozen=True)
-class FuturesContract:
-    ticker: str
-    first_trade_date: pd.Timestamp
-    last_trade_date: pd.Timestamp
-    settlement_date: pd.Timestamp
-
-
-def download_vx_contracts(start_date: str, end_date: str) -> pd.DataFrame:
-    path = cache_path("contracts", f"{VX_PRODUCT_CODE}_{start_date}_{end_date}.parquet")
-    cached = read_cached_frame(path)
-    if cached is not None:
-        return cached
-
-    api_key = massive_api_key()
-    session = requests.Session()
-    url = f"{MASSIVE_REST_BASE}/futures/v1/contracts"
-    params: dict[str, Any] = {
-        "product_code": VX_PRODUCT_CODE,
-        "first_trade_date.lte": end_date,
-        "last_trade_date.gte": start_date,
-        "limit": 1000,
-        "sort": "last_trade_date.asc",
-        "apiKey": api_key,
-    }
-    rows = fetch_paginated(session, url, params, api_key=api_key)
-    if not rows:
-        raise ValueError(
-            f"No Massive futures contracts found for product_code={VX_PRODUCT_CODE!r}."
-        )
-
-    frame = pd.DataFrame(rows)
-    if "type" in frame.columns:
-        frame = frame.loc[frame["type"].isna() | (frame["type"].astype(str).str.lower() != "combo")]
-    keep = ["ticker", "first_trade_date", "last_trade_date", "settlement_date", "name", "type"]
-    frame = frame[[column for column in keep if column in frame.columns]].copy()
-    for column in ["first_trade_date", "last_trade_date", "settlement_date"]:
-        frame[column] = pd.to_datetime(frame[column], errors="coerce").dt.normalize()
-    frame = frame.dropna(subset=["ticker", "first_trade_date", "last_trade_date", "settlement_date"])
-    if frame.empty:
-        raise ValueError(
-            f"Massive returned contracts for product_code={VX_PRODUCT_CODE!r}, but none "
-            "survived the single-contract/date filters."
-        )
-    frame = frame.drop_duplicates("ticker").sort_values(["settlement_date", "ticker"])
-    write_cached_frame(path, frame)
-    return frame
-
-
-def download_futures_session_aggs(
-    contract: FuturesContract,
-    start_date: str,
-    end_date: str,
-) -> pd.DataFrame:
-    begin = max(pd.Timestamp(start_date), contract.first_trade_date).date().isoformat()
-    end = min(pd.Timestamp(end_date), contract.last_trade_date).date().isoformat()
-    if begin > end:
-        return pd.DataFrame(columns=["date", "ticker", "price", "close", "settlement_price", "volume"])
-
-    path = cache_path("futures-aggs", f"{contract.ticker}_{begin}_{end}.parquet")
-    cached = read_cached_frame(path)
-    if cached is not None:
-        return cached
-
-    api_key = massive_api_key()
-    session = requests.Session()
-    enc = quote(contract.ticker, safe="")
-    url = f"{MASSIVE_REST_BASE}/futures/v1/aggs/{enc}"
-    params: dict[str, Any] = {
-        "resolution": "1session",
-        "window_start.gte": begin,
-        "window_start.lte": end,
-        "limit": 50000,
-        "sort": "window_start.asc",
-        "apiKey": api_key,
-    }
-    rows = fetch_paginated(session, url, params, api_key=api_key)
-    if not rows:
-        return pd.DataFrame(columns=["date", "ticker", "price", "close", "settlement_price", "volume"])
-
-    records = []
-    for row in rows:
-        close = row.get("close")
-        settlement = row.get("settlement_price")
-        price = settlement if settlement is not None else close
-        if price is None:
-            continue
-        session_end = row.get("session_end_date")
-        date = (
-            pd.Timestamp(session_end).normalize()
-            if session_end
-            else pd.Timestamp(int(row["window_start"]), unit="ns", tz="UTC")
-            .tz_convert("America/Chicago")
-            .normalize()
-            .tz_localize(None)
-        )
-        records.append(
-            {
-                "date": date,
-                "ticker": contract.ticker,
-                "price": float(price),
-                "close": float(close) if close is not None else np.nan,
-                "settlement_price": float(settlement) if settlement is not None else np.nan,
-                "volume": float(row.get("volume", np.nan)),
-            }
-        )
-
-    frame = pd.DataFrame.from_records(records)
-    if frame.empty:
-        return frame
-    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame = frame.drop_duplicates(["date", "ticker"], keep="last").sort_values(["date", "ticker"])
-    write_cached_frame(path, frame)
-    return frame
-
-
-def load_vx_futures_panel(start_date: str, end_date: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    contracts = download_vx_contracts(start_date, end_date)
-    contract_objects = [
-        FuturesContract(
-            ticker=str(row.ticker),
-            first_trade_date=row.first_trade_date,
-            last_trade_date=row.last_trade_date,
-            settlement_date=row.settlement_date,
-        )
-        for row in contracts.itertuples(index=False)
-    ]
-
-    pieces = [
-        download_futures_session_aggs(contract, start_date, end_date)
-        for contract in contract_objects
-    ]
-    nonempty_pieces = [piece for piece in pieces if not piece.empty]
-    if not nonempty_pieces:
-        raise ValueError("No Massive futures aggregate rows were returned for VX contracts.")
-    aggs = pd.concat(nonempty_pieces, ignore_index=True)
-    aggs = aggs.merge(
-        contracts[["ticker", "settlement_date"]],
-        on="ticker",
-        how="left",
-        validate="many_to_one",
-    )
-    aggs["dte"] = (aggs["settlement_date"] - aggs["date"]).dt.days
-    aggs = aggs.loc[
-        (aggs["dte"] > 0)
-        & (aggs["dte"] <= MAX_CONTRACT_DTE_DAYS)
-        & np.isfinite(aggs["price"])
-        & (aggs["price"] > 0)
-    ].copy()
-    return contracts, aggs.sort_values(["date", "dte", "ticker"])
-
-
-def interpolate_vx30(day_rows: pd.DataFrame) -> pd.Series:
-    rows = day_rows.sort_values("dte")
-    target = TARGET_DTE_DAYS
-
-    exact = rows.loc[rows["dte"] == target]
-    if not exact.empty:
-        row = exact.iloc[0]
-        return pd.Series(
-            {
-                "VX30": row["price"],
-                "front_ticker": row["ticker"],
-                "back_ticker": row["ticker"],
-                "front_dte": row["dte"],
-                "back_dte": row["dte"],
-                "interp_weight_back": 0.0,
-                "construction": "exact",
-            }
-        )
-
-    front = rows.loc[rows["dte"] < target].tail(1)
-    back = rows.loc[rows["dte"] > target].head(1)
-    if not front.empty and not back.empty:
-        front_row = front.iloc[0]
-        back_row = back.iloc[0]
-        weight_back = (target - front_row["dte"]) / (back_row["dte"] - front_row["dte"])
-        vx30 = (1.0 - weight_back) * front_row["price"] + weight_back * back_row["price"]
-        return pd.Series(
-            {
-                "VX30": vx30,
-                "front_ticker": front_row["ticker"],
-                "back_ticker": back_row["ticker"],
-                "front_dte": front_row["dte"],
-                "back_dte": back_row["dte"],
-                "interp_weight_back": weight_back,
-                "construction": "interpolated",
-            }
-        )
-
-    nearest_row = rows.iloc[(rows["dte"] - target).abs().to_numpy().argmin()]
-    return pd.Series(
-        {
-            "VX30": nearest_row["price"],
-            "front_ticker": nearest_row["ticker"],
-            "back_ticker": nearest_row["ticker"],
-            "front_dte": nearest_row["dte"],
-            "back_dte": nearest_row["dte"],
-            "interp_weight_back": 0.0,
-            "construction": "nearest",
-        }
-    )
-
-
-def build_vx30_series(futures_aggs: pd.DataFrame) -> pd.DataFrame:
-    vx30 = futures_aggs.groupby("date", group_keys=False).apply(interpolate_vx30)
-    vx30.index = pd.to_datetime(vx30.index).normalize()
-    vx30["VX30"] = pd.to_numeric(vx30["VX30"], errors="coerce")
-    for column in ["front_dte", "back_dte", "interp_weight_back"]:
-        vx30[column] = pd.to_numeric(vx30[column], errors="coerce")
-    return vx30.sort_index()
 
 
 def max_drawdown(log_returns: pd.Series) -> float:
@@ -1040,8 +721,7 @@ else:
 # - The VX30 construction is a public-data proxy. Yahoo `VX=F` is not an official
 #   30-day constant-maturity VIX futures index, and the Cboe VIX fallback is a
 #   spot volatility index rather than a futures price.
-# - Futures settlement and index timestamps are assumed to be comparable at a
-#   daily frequency.
+# - Proxy and index timestamps are assumed to be comparable at a daily frequency.
 # - The backtest ignores costs and assumes exposure can be obtained at the daily
 #   VX30 proxy mark.
 # - Long volatility returns are episodic. Threshold performance can be dominated
