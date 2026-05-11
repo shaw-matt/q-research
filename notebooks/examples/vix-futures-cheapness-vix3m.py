@@ -36,6 +36,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -80,11 +81,9 @@ apply_default_style()
 #
 # - `VIX3M` is treated as the market price of SPX variance over roughly the next
 #   90 calendar days.
-# - `VX30` is approximated from listed VIX futures by linearly interpolating
-#   daily futures settlement/close prices to a 30-calendar-day constant maturity.
-# - If bracketing contracts are unavailable for a date, the nearest active VX
-#   contract within the maximum DTE filter is used as a deliberately dirty
-#   fallback.
+# - `VX30` is a deliberately dirty public-data proxy. The preferred source is
+#   Yahoo's continuous VIX futures symbol `VX=F`; if Yahoo is unavailable during
+#   rendering, Cboe spot VIX is used as a render-safe level proxy.
 # - Signals are computed from daily end-of-session marks. The lagged simulation
 #   waits one full trading session before acting on the signal.
 # - Returns are log returns on the VX30 price proxy. Transaction costs, slippage,
@@ -93,22 +92,23 @@ apply_default_style()
 #
 # ## Data Sources
 #
-# - Massive REST indices/stocks aggregate endpoint:
-#   `GET /v2/aggs/ticker/I:VIX3M/range/1/day/{from}/{to}`.
-# - Massive REST futures contracts endpoint:
-#   `GET /futures/v1/contracts?product_code=VX`.
-# - Massive REST futures aggregate endpoint:
-#   `GET /futures/v1/aggs/{ticker}?resolution=1session`.
+# - Cboe public index CSV:
+#   `https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv`.
+# - Preferred trade-leg proxy: Yahoo Finance daily chart data for `VX=F`
+#   (continuous VIX futures proxy).
+# - Render-safe fallback trade-leg proxy: Cboe public VIX index CSV when Yahoo
+#   blocks/rate-limits the request.
 #
-# Set `MASSIVE_API_KEY` or `POLYGON_API_KEY` in the environment or `.env` file.
+# This notebook intentionally avoids Massive so the website render does not
+# depend on index/futures REST entitlements.
 
 # %%
 START_DATE = os.getenv("VIX_CHEAPNESS_START_DATE", "2020-01-01")
 END_DATE = os.getenv("VIX_CHEAPNESS_END_DATE", pd.Timestamp.today(tz="UTC").date().isoformat())
 
-MASSIVE_REST_BASE = os.getenv("MASSIVE_REST_URL", "https://api.massive.com").rstrip("/")
-VIX3M_TICKER = os.getenv("VIX3M_TICKER", "I:VIX3M")
+VIX3M_TICKER = os.getenv("VIX3M_TICKER", "VIX3M")
 VX_PRODUCT_CODE = os.getenv("VX_PRODUCT_CODE", "VX")
+YAHOO_VX_TICKER = os.getenv("VIX_CHEAPNESS_YAHOO_VX_TICKER", "VX=F")
 
 TARGET_DTE_DAYS = int(os.getenv("VX_TARGET_DTE_DAYS", "30"))
 MAX_CONTRACT_DTE_DAYS = int(os.getenv("VX_MAX_CONTRACT_DTE_DAYS", "120"))
@@ -121,7 +121,7 @@ FORWARD_RETURN_HORIZONS = [1, 5, 10, 21]
 THRESHOLD_GRID = np.round(np.arange(-2.50, -0.45, 0.25), 2)
 
 REST_CACHE_DIR = Path(
-    os.getenv("Q_RESEARCH_MASSIVE_REST_CACHE_DIR", ".cache/q-research/massive-rest-vix")
+    os.getenv("Q_RESEARCH_PUBLIC_VOL_CACHE_DIR", ".cache/q-research/public-vol-data")
 )
 
 
@@ -202,6 +202,142 @@ def read_cached_frame(path: Path) -> pd.DataFrame | None:
 def write_cached_frame(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_parquet(path)
+
+
+def download_cboe_index_history(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> pd.Series:
+    """Download a public Cboe daily index history CSV."""
+    symbol_u = symbol.upper().lstrip("^")
+    path = cache_path("cboe-index", f"{symbol_u}_{start_date}_{end_date}.parquet")
+    cached = read_cached_frame(path)
+    if cached is not None:
+        return cached["close"].rename(symbol_u)
+
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol_u}_History.csv"
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    raw = pd.read_csv(StringIO(response.text))
+    raw.columns = [str(column).strip().lower() for column in raw.columns]
+    if "date" not in raw.columns or "close" not in raw.columns:
+        raise ValueError(f"Cboe {symbol_u} CSV did not contain date/close columns.")
+    frame = raw[["date", "close"]].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["date", "close"]).drop_duplicates("date", keep="last")
+    frame = frame.sort_values("date").set_index("date")
+    frame = frame.loc[
+        (frame.index >= pd.Timestamp(start_date)) & (frame.index <= pd.Timestamp(end_date))
+    ]
+    if frame.empty:
+        raise ValueError(f"No Cboe {symbol_u} rows between {start_date} and {end_date}.")
+    write_cached_frame(path, frame)
+    return frame["close"].rename(symbol_u)
+
+
+def download_yahoo_daily_close(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> pd.Series:
+    """Download daily closes from Yahoo's public chart endpoint."""
+    path = cache_path("yahoo-chart", f"{symbol}_{start_date}_{end_date}.parquet")
+    cached = read_cached_frame(path)
+    if cached is not None:
+        return cached["close"].rename(symbol)
+
+    period1 = int(pd.Timestamp(start_date, tz="UTC").timestamp())
+    # Yahoo's period2 is exclusive. Add one day so the requested end date can appear.
+    period2 = int((pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)).timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+    response = requests.get(
+        url,
+        params={
+            "period1": period1,
+            "period2": period2,
+            "interval": "1d",
+            "events": "history",
+            "includeAdjustedClose": "true",
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise ValueError(f"Yahoo returned an error for {symbol}: {chart['error']}")
+    result = (chart.get("result") or [None])[0]
+    if not result or not result.get("timestamp"):
+        raise ValueError(f"Yahoo returned no daily rows for {symbol}.")
+
+    quote_data = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    timestamps = result["timestamp"]
+    closes = quote_data.get("close") or []
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(timestamps, unit="s", utc=True)
+            .tz_convert("America/New_York")
+            .normalize()
+            .tz_localize(None),
+            "close": closes,
+        }
+    )
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["date", "close"]).drop_duplicates("date", keep="last")
+    frame = frame.sort_values("date").set_index("date")
+    frame = frame.loc[
+        (frame.index >= pd.Timestamp(start_date)) & (frame.index <= pd.Timestamp(end_date))
+    ]
+    if frame.empty:
+        raise ValueError(f"No Yahoo {symbol} rows between {start_date} and {end_date}.")
+    write_cached_frame(path, frame)
+    return frame["close"].rename(symbol)
+
+
+def load_public_vol_proxy_data(
+    start_date: str,
+    end_date: str,
+) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
+    """Load VIX3M and a public volatility trade-leg proxy without Massive."""
+    status_rows: list[dict[str, str]] = []
+    vix3m_series = download_cboe_index_history("VIX3M", start_date, end_date)
+    status_rows.append(
+        {
+            "series": "VIX3M",
+            "source": "Cboe public CSV",
+            "status": "loaded",
+            "message": "Cboe VIX3M_History.csv",
+        }
+    )
+
+    try:
+        proxy = download_yahoo_daily_close(YAHOO_VX_TICKER, start_date, end_date)
+        status_rows.append(
+            {
+                "series": "VX30 proxy",
+                "source": "Yahoo Finance",
+                "status": "loaded",
+                "message": f"{YAHOO_VX_TICKER} daily close",
+            }
+        )
+    except Exception as exc:
+        proxy = download_cboe_index_history("VIX", start_date, end_date)
+        status_rows.append(
+            {
+                "series": "VX30 proxy",
+                "source": "Cboe public CSV fallback",
+                "status": "loaded",
+                "message": (
+                    f"Yahoo {YAHOO_VX_TICKER} unavailable "
+                    f"({safe_exception_message(exc)}); using VIX_History.csv"
+                ),
+            }
+        )
+
+    return vix3m_series, proxy.rename("VX30"), pd.DataFrame(status_rows)
 
 
 def download_massive_daily_closes(
@@ -542,39 +678,37 @@ def safe_exception_message(exc: BaseException) -> str:
 def display_data_unavailable(section: str) -> None:
     display(
         Markdown(
-            f"**{section} skipped.** Required Massive VIX3M/VX data did not load: "
+            f"**{section} skipped.** Required public VIX3M/proxy data did not load: "
             f"`{DATA_LOAD_ERROR}`"
         )
     )
 
 
 # %% [markdown]
-# ## Load Massive Data
+# ## Load Public Data
 #
-# The futures section intentionally discovers contracts from Massive rather than
-# assuming a continuous-contract symbol. This keeps the notebook explicit about
-# how `VX30` is built and makes the interpolation auditable.
+# The preferred trade-leg proxy is Yahoo `VX=F`. If Yahoo is unavailable during
+# rendering, the notebook falls back to Cboe's public VIX index history so the
+# research page still renders without paid data entitlements.
 
 # %%
 DATA_AVAILABLE = False
 DATA_LOAD_ERROR: str | None = None
-vix3m = pd.Series(dtype=float, name=VIX3M_TICKER)
-contracts = pd.DataFrame()
-futures_aggs = pd.DataFrame()
+source_status = pd.DataFrame()
+vix3m = pd.Series(dtype=float, name="VIX3M")
 vx30 = pd.DataFrame()
 data = pd.DataFrame()
 
 try:
-    vix3m = download_massive_daily_closes(VIX3M_TICKER, START_DATE, END_DATE)
-    contracts, futures_aggs = load_vx_futures_panel(START_DATE, END_DATE)
-    vx30 = build_vx30_series(futures_aggs)
+    vix3m, vol_proxy, source_status = load_public_vol_proxy_data(START_DATE, END_DATE)
+    vx30 = pd.DataFrame({"VX30": vol_proxy})
 
     data = pd.concat([vx30["VX30"], vix3m.rename("VIX3M")], axis=1).dropna()
     data = data.loc[(data["VX30"] > 0) & (data["VIX3M"] > 0)].copy()
     if data.empty:
         raise ValueError(
             "No overlapping positive VX30/VIX3M observations were available. "
-            "Check the Massive index/futures entitlements, tickers, and date range."
+            "Check public data source availability, tickers, and date range."
         )
     data = add_forward_log_returns(data, "VX30", FORWARD_RETURN_HORIZONS)
     data["vx30_log_return"] = np.log(data["VX30"] / data["VX30"].shift(1))
@@ -597,24 +731,20 @@ if DATA_AVAILABLE:
 Loaded **{len(data):,}** aligned VX30/VIX3M observations from **{data.index.min().date()}**
 through **{data.index.max().date()}**.
 
-- VX contracts discovered: **{contracts['ticker'].nunique():,}**
-- VX futures session rows after DTE filters: **{len(futures_aggs):,}**
-- VX30 construction mix:
+- VIX3M source: **Cboe public CSV**
+- Trade-leg proxy source: **{source_status.loc[source_status['series'].eq('VX30 proxy'), 'source'].iloc[0]}**
 """
         )
     )
-    display(vx30["construction"].value_counts().to_frame("sessions"))
+    display(source_status)
     display(data[["VX30", "VIX3M", "cheapness_log_ratio", "cheapness_zscore"]].tail())
 else:
     display(
         Markdown(
-            "### Massive data unavailable\n\n"
-            f"The notebook structure rendered, but the live Massive request needed "
+            "### Public volatility data unavailable\n\n"
+            f"The notebook structure rendered, but the public data request needed "
             f"for this study failed: `{DATA_LOAD_ERROR}`\n\n"
-            "The publish workflow currently has a Massive REST key, but the log "
-            "shows it is not entitled to the VIX3M index aggregate endpoint. "
-            "Grant index/VIX3M access or pre-populate the configured Massive REST "
-            "cache to render the full analysis."
+            "Check network access to Cboe public CSVs and Yahoo Finance."
         )
     )
 
@@ -907,22 +1037,23 @@ else:
 #
 # - The comparison is intentionally biased: VIX3M is an SPX implied-volatility
 #   index, while VX30 is a futures price built from listed VIX futures.
-# - The VX30 construction is a price-level interpolation. It does not replicate
-#   VIX futures from SPX/VIX options, does not model convexity, and does not
-#   match an official constant-maturity index.
+# - The VX30 construction is a public-data proxy. Yahoo `VX=F` is not an official
+#   30-day constant-maturity VIX futures index, and the Cboe VIX fallback is a
+#   spot volatility index rather than a futures price.
 # - Futures settlement and index timestamps are assumed to be comparable at a
 #   daily frequency.
 # - The backtest ignores costs and assumes exposure can be obtained at the daily
 #   VX30 proxy mark.
 # - Long volatility returns are episodic. Threshold performance can be dominated
-#   by crisis windows and the sample covered by Massive futures data.
+#   by crisis windows and by whichever public proxy is available during render.
 #
 # ## Conclusion
 #
 # This notebook implements the deliberately dirty idea: use VIX3M as the SPX
-# implied-volatility anchor, use a Massive-derived 30-day VIX futures proxy as
+# implied-volatility anchor, use a public-data VIX futures/volatility proxy as
 # the tradeable leg, standardize `log(VX30 / VIX3M)` against its own one-year
-# history, and get long VX30 only when that ratio is extremely low.
+# history, and get long the volatility proxy only when that ratio is extremely
+# low.
 #
 # The important checks are whether decile 1 has meaningfully positive forward
 # VX30 returns and whether the threshold rule still looks useful after a full
