@@ -13,14 +13,14 @@
 # ---
 
 # %% [markdown]
-# # Equal-Weight Portfolio of SPY/TLT, UPRO Residual, and Dirty VIX Signals
+# # Equal-Weight Portfolio of SPY/TLT and UPRO Residual Signals
 #
 # ## Research Question
 #
-# If we combine the SPY/TLT calendar and relative-value signals, the BTC/QQQ
-# residual long-UPRO rule, and the dirty VIX cheapness rule into one portfolio,
-# does a simple equal-weight blend improve diversification and risk-adjusted
-# performance versus each signal on a standalone basis?
+# If we combine the SPY/TLT calendar and relative-value signals and the BTC/QQQ
+# residual long-UPRO rule into one portfolio, does a simple equal-weight blend
+# improve diversification and risk-adjusted performance versus each signal on a
+# standalone basis?
 #
 # **Portfolio decision for this notebook:** equal-weight blending across all
 # active signal legs (each leg receives `1/N` of capital), with no optimization
@@ -37,10 +37,6 @@
 # **Bitcoin UPRO prediction thesis:** when BTC strength is unusually high relative
 # to a beta-adjusted QQQ move at the U.S. equity close, the residual can capture
 # incremental risk-on information not fully explained by equities.
-#
-# **Dirty VIX thesis:** when a public VX30 proxy is unusually cheap versus VIX3M,
-# a lagged long-volatility leg may add crisis convexity and a return stream that
-# differs from the stock/bond and risk-on UPRO legs.
 
 # %%
 from __future__ import annotations
@@ -92,8 +88,6 @@ apply_default_style()
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-#   5. Dirty VIX cheapness long VX30 proxy when `zscore(log(VX30 / VIX3M))`
-#      is below the entry threshold.
 # - BTC-derivatives long/flat UPRO overlays are built from Massive OPRA ETF
 #   option features and optional supplemental local derivatives fields.
 # - Portfolio construction is fixed to equal-weight (`1/N` per signal) for the
@@ -107,8 +101,6 @@ apply_default_style()
 #   residual signal via `research.upro_residual`.
 # - Massive REST OPRA option contracts/day-aggregates for IBIT/BITO proxy
 #   derivatives features (cached on disk).
-# - Cboe public VIX3M history plus Yahoo `VX=F` (with Cboe VIX fallback) for
-#   the dirty VIX long-volatility proxy.
 
 # %%
 START_DATE = "2004-01-01"
@@ -501,12 +493,6 @@ _bundle = build_signal_portfolio_bundle(_portfolio_params, data_source="s3")
 signal_returns = _bundle.signal_returns
 core_signal_names = signal_returns.columns.tolist()
 per_signal_exposure = _bundle.per_signal_exposure
-dirty_vix_frame = _bundle.dirty_vix_frame
-
-# %%
-dirty_vix_frame[
-    ["VX30", "VIX3M", "cheapness_zscore", "vx30_exposure", "strategy_return"]
-].tail(10)
 
 # %%
 upro_prices = download_massive_daily_closes(
@@ -540,7 +526,6 @@ if not btc_derivative_returns.empty:
                     "UPRO": btc_derivative_exposure[column]
                     .reindex(signal_returns.index)
                     .fillna(0.0),
-                    "VX30": 0.0,
                 },
                 index=signal_returns.index,
             )
@@ -558,8 +543,7 @@ upro_forward_returns.reindex(signal_returns.index).tail(10)
 # %% [markdown]
 # ## Methodology
 #
-# 1. Build daily return streams for the three SPY/TLT rules, the UPRO residual rule,
-#    and the dirty VIX cheapness rule.
+# 1. Build daily return streams for the three SPY/TLT rules and the UPRO residual rule.
 # 2. Build BTC derivatives features from Massive OPRA ETF option data (plus any
 #    supplemental local derivatives fields), then lag features by one session.
 # 3. Compute UPRO forward returns (1/5/10/21-day) for cross-horizon diagnostics.
@@ -737,20 +721,16 @@ plt.show()
 # - Costs, turnover drag, and implementation constraints are not modeled.
 # - OPRA feature coverage depends on ETF option liquidity, selected DTE/strike
 #   filters, and Massive REST API access.
-# - VX30 is a dirty public-data proxy. Yahoo `VX=F` is not an official 30-day
-#   constant-maturity VIX futures index, and the Cboe VIX fallback is spot
-#   volatility rather than a futures price.
 # - The inner join across active signal legs can shorten the combined sample.
 #
 # ## Conclusion
 #
 # This notebook backtests an equal-weight combined-signal portfolio using the
-# three SPY/TLT legs, the BTC/QQQ residual UPRO leg, the dirty VIX long-volatility
-# leg, and optional BTC-derivatives UPRO signal legs. It also reports UPRO forward
-# returns across multiple horizons for diagnostic checks while comparing
-# diversification (correlation) and market exposure (beta to SPY proxy) across all
-# active signals. Export daily weights with `uv run python
-# scripts/export_equal_weight_portfolio_weights.py`.
+# three SPY/TLT legs, the BTC/QQQ residual UPRO leg, and optional BTC-derivatives
+# UPRO signal legs. It also reports UPRO forward returns across multiple horizons
+# for diagnostic checks while comparing diversification (correlation) and market
+# exposure (beta to SPY proxy) across all active signals. Export daily weights
+# with `uv run python scripts/export_equal_weight_portfolio_weights.py`.
 #
 # ## Next Research Ideas
 #

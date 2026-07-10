@@ -13,7 +13,7 @@
 # ---
 
 # %% [markdown]
-# # Volatility-Targeted Futures Portfolio of SPY/TLT, UPRO Residual, and Dirty VIX Signals
+# # Volatility-Targeted Futures Portfolio of SPY/TLT and UPRO Residual Signals
 #
 # ## Research Question
 #
@@ -87,15 +87,12 @@ apply_default_style()
 #   2. 5-day mean-reversion in `log(SPY/TLT)` as a long-only switch.
 #   3. TLT turn-of-month long-last-5 / short-first-5 rule.
 #   4. BTC/QQQ residual z-score long UPRO (flat when signal is off).
-#   5. Dirty VIX cheapness long VX30 proxy when `zscore(log(VX30 / VIX3M))`
-#      is below the entry threshold.
-#   6. Optional BTC-derivatives UPRO legs when supplemental derivatives data or
+#   5. Optional BTC-derivatives UPRO legs when supplemental derivatives data or
 #      Massive OPRA option access is available.
 # - Futures-equivalent returns use close-to-close proxy returns:
 #   - `SPY` exposure maps to S&P 500 futures notional (`ES` proxy return = SPY).
 #   - `UPRO` exposure maps to 3x S&P 500 futures notional (`ES` proxy return = SPY).
 #   - `TLT` exposure maps to long-bond futures notional (`ZB` proxy return = TLT).
-#   - `VX30` exposure maps to VIX futures notional (`VX` proxy return = VX30).
 # - The futures rows are not contract-level backtests. They are notional weights
 #   per $1 of strategy capital; convert to contracts with broker futures prices,
 #   multipliers, and account equity.
@@ -111,8 +108,6 @@ apply_default_style()
 #   residual signal via `research.upro_residual`.
 # - Optional Massive REST OPRA option contracts/day-aggregates for IBIT/BITO
 #   proxy derivatives features, plus optional local BTC derivatives fields.
-# - Cboe public VIX3M history plus Yahoo `VX=F` (with Cboe VIX fallback) for
-#   the dirty VIX long-volatility proxy.
 
 # %%
 START_DATE = "2004-01-01"
@@ -161,14 +156,6 @@ FUTURES_EXPOSURE_MAP = pd.DataFrame(
             "return_proxy": "TLT",
             "contract_multiplier": 1_000.0,
             "implementation_note": "Approximate TLT duration with CBOT 30-year Treasury bond futures.",
-        },
-        {
-            "proxy_asset": "VX30",
-            "futures_symbol": "VX",
-            "notional_multiplier": 1.0,
-            "return_proxy": "VX30",
-            "contract_multiplier": 1_000.0,
-            "implementation_note": "Dirty VX30 proxy mapped to VIX futures notional.",
         },
     ]
 ).set_index("proxy_asset")
@@ -276,7 +263,6 @@ def build_futures_return_proxies(
     returns = pd.DataFrame(index=signal_index)
     returns["ES"] = market_prices["SPY"].pct_change().reindex(signal_index)
     returns["ZB"] = market_prices["TLT"].pct_change().reindex(signal_index)
-    returns["VX"] = bundle.dirty_vix_frame["VX30"].pct_change().reindex(signal_index)
     return returns
 
 
@@ -351,7 +337,6 @@ def build_equal_weight_notebook_signal_set(
                         "UPRO": btc_derivative_exposure[column]
                         .reindex(signal_returns.index)
                         .fillna(0.0),
-                        "VX30": 0.0,
                     },
                     index=signal_returns.index,
                 )
@@ -365,7 +350,6 @@ def build_equal_weight_notebook_signal_set(
             signal_returns=signal_returns,
             per_signal_exposure=per_signal_exposure,
             upro_frame=bundle.upro_frame,
-            dirty_vix_frame=bundle.dirty_vix_frame,
         )
 
     return bundle, per_signal_exposure, core_signal_names, derivative_features
@@ -394,7 +378,7 @@ signal_returns.tail(10)
 #    volatility-targeted notebooks, including optional BTC-derivatives UPRO legs
 #    when data is available.
 # 2. Map each proxy exposure to futures-equivalent notional:
-#    `SPY -> ES`, `UPRO -> 3x ES`, `TLT -> ZB`, and `VX30 -> VX`.
+#    `SPY -> ES`, `UPRO -> 3x ES`, `TLT -> ZB`.
 # 3. Recompute signal returns from futures notional weights and proxy futures
 #    return streams.
 # 4. Assign each signal an equal fixed blend weight of `1/N`.
@@ -653,8 +637,6 @@ plt.show()
 #   should be revisited with actual Treasury futures data and duration matching.
 # - `UPRO -> 3x ES` avoids UPRO ETF mechanics, fees, and daily compounding, so the
 #   futures-equivalent UPRO legs can differ materially from ETF realized returns.
-# - The VX30 leg uses a public-data VIX futures proxy and does not model futures
-#   rolls or term-structure carry beyond that proxy return stream.
 # - The 5x leverage cap only limits the volatility multiplier; gross futures
 #   notional can be higher when underlying signal exposures are already levered
 #   through the `UPRO -> 3x ES` mapping.

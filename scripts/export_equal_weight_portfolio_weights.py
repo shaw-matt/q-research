@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export daily equal-weight signal portfolio weights (portfolio notebook rules).
 
-Writes a CSV suitable for dashboards or manual trading: net SPY/TLT/UPRO/VX30-proxy
+Writes a CSV suitable for dashboards or manual trading: net SPY/TLT/UPRO
 weights per $1 of strategy capital and the model equal-weight portfolio return by
 session date.
 
@@ -146,12 +146,6 @@ def main() -> None:
     parser.add_argument("--beta-lookback-days", type=int, default=40)
     parser.add_argument("--zscore-lookback-days", type=int, default=20)
     parser.add_argument("--entry-zscore", type=float, default=1.5)
-    parser.add_argument("--dirty-vix-start-date", type=str, default=None)
-    parser.add_argument("--dirty-vix-zscore-days", type=int, default=252)
-    parser.add_argument("--dirty-vix-min-zscore-obs", type=int, default=None)
-    parser.add_argument("--dirty-vix-entry-zscore", type=float, default=-1.5)
-    parser.add_argument("--dirty-vix-execution-lag-sessions", type=int, default=1)
-    parser.add_argument("--dirty-vix-yahoo-ticker", type=str, default="VX=F")
     parser.add_argument(
         "--data-source",
         choices=("rest", "s3"),
@@ -173,12 +167,6 @@ def main() -> None:
         beta_lookback_days=args.beta_lookback_days,
         zscore_lookback_days=args.zscore_lookback_days,
         entry_zscore=args.entry_zscore,
-        dirty_vix_start_date=args.dirty_vix_start_date,
-        dirty_vix_rolling_zscore_days=args.dirty_vix_zscore_days,
-        dirty_vix_min_zscore_obs=args.dirty_vix_min_zscore_obs,
-        dirty_vix_entry_zscore=args.dirty_vix_entry_zscore,
-        dirty_vix_execution_lag_sessions=args.dirty_vix_execution_lag_sessions,
-        dirty_vix_yahoo_ticker=args.dirty_vix_yahoo_ticker,
     )
     bundle = build_signal_portfolio_bundle(params, data_source=args.data_source)
     signal_returns = bundle.signal_returns
@@ -210,12 +198,6 @@ def main() -> None:
             "beta_lookback_days": params.beta_lookback_days,
             "zscore_lookback_days": params.zscore_lookback_days,
             "entry_zscore": params.entry_zscore,
-            "dirty_vix_start_date": params.dirty_vix_start_date,
-            "dirty_vix_rolling_zscore_days": params.dirty_vix_rolling_zscore_days,
-            "dirty_vix_min_zscore_obs": params.dirty_vix_min_zscore_obs,
-            "dirty_vix_entry_zscore": params.dirty_vix_entry_zscore,
-            "dirty_vix_execution_lag_sessions": params.dirty_vix_execution_lag_sessions,
-            "dirty_vix_yahoo_ticker": params.dirty_vix_yahoo_ticker,
         },
         "blend": "equal_weight_signal_portfolio",
         "data_source": args.data_source,
@@ -228,10 +210,9 @@ def main() -> None:
         "session_date_max": str(table.index.max().date()) if len(table) else None,
         "note": (
             "weight_* are net exposures per $1 of blended capital (each signal gets 1/n weight). "
-            "Map ETF/proxy exposures to shares or futures-equivalent notional with "
+            "Map ETF exposures to shares or futures-equivalent notional with "
             "account_equity * weight / price. Convention matches the "
-            "spy-tlt-signal-portfolio-vol-target notebook (close-to-close). VX30 is the "
-            "dirty public-data VIX futures/volatility proxy, not an ETF share class."
+            "spy-tlt-signal-portfolio-vol-target notebook (close-to-close)."
         ),
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
